@@ -1,0 +1,316 @@
+package handler
+
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+)
+
+// ScheduleHandler handles schedule endpoints.
+type ScheduleHandler struct {
+	db *gorm.DB
+}
+
+// NewScheduleHandler creates a new ScheduleHandler.
+func NewScheduleHandler(db *gorm.DB) *ScheduleHandler {
+	return &ScheduleHandler{db: db}
+}
+
+type createScheduleReq struct {
+	Title         string       `json:"title"`
+	SummaryMode   *int         `json:"summary_mode"`
+	CronExpr      string       `json:"cron_expr" binding:"required"`
+	TimeRangeType int          `json:"time_range_type"`
+	Sources       []sourceReq  `json:"sources"`
+	Participants  []participantReq `json:"participants"`
+}
+
+type updateScheduleReq struct {
+	Title         *string      `json:"title"`
+	SummaryMode   *int         `json:"summary_mode"`
+	CronExpr      *string      `json:"cron_expr"`
+	TimeRangeType *int         `json:"time_range_type"`
+	Sources       []sourceReq  `json:"sources,omitempty"`
+	Participants  []participantReq `json:"participants,omitempty"`
+}
+
+type toggleScheduleReq struct {
+	IsActive bool `json:"is_active"`
+}
+
+// CreateSchedule handles POST /api/v1/summary-schedules
+func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
+	spaceID := middleware.GetSpaceID(c)
+	userID := middleware.GetUserID(c)
+
+	var req createScheduleReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: err.Error()})
+		return
+	}
+
+	now := time.Now().UTC()
+	nextRun, err := service.NextRun(req.CronExpr, now)
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, apiResponse{Code: 40010, Message: "无效的 cron 表达式: " + req.CronExpr})
+		return
+	}
+
+	summaryMode := 1
+	if req.SummaryMode != nil {
+		summaryMode = *req.SummaryMode
+	}
+	if req.TimeRangeType == 0 {
+		req.TimeRangeType = 2
+	}
+
+	var sourceConfig model.JSON
+	if len(req.Sources) > 0 {
+		b, _ := json.Marshal(req.Sources)
+		sourceConfig = b
+	}
+
+	var participantConfig model.JSON
+	if len(req.Participants) > 0 {
+		b, _ := json.Marshal(req.Participants)
+		participantConfig = b
+	}
+
+	sched := model.SummarySchedule{
+		SpaceID:           spaceID,
+		CreatorID:         userID,
+		Title:             req.Title,
+		SummaryMode:       summaryMode,
+		CronExpr:          req.CronExpr,
+		TimeRangeType:     req.TimeRangeType,
+		SourceConfig:      sourceConfig,
+		ParticipantConfig: participantConfig,
+		NextRunAt:         &nextRun,
+	}
+	if err := h.db.Create(&sched).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+		return
+	}
+
+	ok(c, gin.H{
+		"schedule_id": sched.ID,
+		"next_run_at": nextRun.Format(time.RFC3339),
+	})
+}
+
+// ListSchedules handles GET /api/v1/summary-schedules
+func (h *ScheduleHandler) ListSchedules(c *gin.Context) {
+	spaceID := middleware.GetSpaceID(c)
+
+	var schedules []model.SummarySchedule
+	h.db.Where("space_id = ? AND deleted_at IS NULL", spaceID).
+		Order("created_at DESC").
+		Find(&schedules)
+
+	items := make([]gin.H, 0, len(schedules))
+	for _, s := range schedules {
+		item := gin.H{
+			"schedule_id":        s.ID,
+			"title":              s.Title,
+			"summary_mode":       s.SummaryMode,
+			"cron_expr":          s.CronExpr,
+			"time_range_type":    s.TimeRangeType,
+			"source_config":      s.SourceConfig,
+			"participant_config": s.ParticipantConfig,
+			"is_active":          s.IsActive,
+			"created_at":         s.CreatedAt.Format(time.RFC3339),
+		}
+		if s.LastRunAt != nil {
+			item["last_run_at"] = s.LastRunAt.Format(time.RFC3339)
+		}
+		if s.NextRunAt != nil {
+			item["next_run_at"] = s.NextRunAt.Format(time.RFC3339)
+		}
+		items = append(items, item)
+	}
+
+	ok(c, items)
+}
+
+// GetSchedule handles GET /api/v1/summary-schedules/:id
+func (h *ScheduleHandler) GetSchedule(c *gin.Context) {
+	spaceID := middleware.GetSpaceID(c)
+	schedID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid schedule id"})
+		return
+	}
+
+	var sched model.SummarySchedule
+	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", schedID, spaceID).First(&sched).Error; err != nil {
+		bizErr(c, service.NewBizError(40008, "定时配置不存在", http.StatusNotFound))
+		return
+	}
+
+	item := gin.H{
+		"schedule_id":        sched.ID,
+		"title":              sched.Title,
+		"summary_mode":       sched.SummaryMode,
+		"cron_expr":          sched.CronExpr,
+		"time_range_type":    sched.TimeRangeType,
+		"source_config":      sched.SourceConfig,
+		"participant_config": sched.ParticipantConfig,
+		"is_active":          sched.IsActive,
+		"created_at":         sched.CreatedAt.Format(time.RFC3339),
+	}
+	if sched.LastRunAt != nil {
+		item["last_run_at"] = sched.LastRunAt.Format(time.RFC3339)
+	}
+	if sched.NextRunAt != nil {
+		item["next_run_at"] = sched.NextRunAt.Format(time.RFC3339)
+	}
+
+	ok(c, item)
+}
+
+// UpdateSchedule handles PUT /api/v1/summary-schedules/:id
+func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
+	spaceID := middleware.GetSpaceID(c)
+	userID := middleware.GetUserID(c)
+	schedID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid schedule id"})
+		return
+	}
+
+	var sched model.SummarySchedule
+	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", schedID, spaceID).First(&sched).Error; err != nil {
+		bizErr(c, service.NewBizError(40008, "定时配置不存在", http.StatusNotFound))
+		return
+	}
+	if sched.CreatorID != userID {
+		bizErr(c, service.NewBizError(40004, "无权限修改", http.StatusForbidden))
+		return
+	}
+
+	var req updateScheduleReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: err.Error()})
+		return
+	}
+
+	updates := make(map[string]interface{})
+	if req.Title != nil {
+		updates["title"] = *req.Title
+	}
+	if req.SummaryMode != nil {
+		updates["summary_mode"] = *req.SummaryMode
+	}
+	if req.CronExpr != nil {
+		nextRun, err := service.NextRun(*req.CronExpr, time.Now().UTC())
+		if err != nil {
+			c.JSON(http.StatusUnprocessableEntity, apiResponse{Code: 40010, Message: "无效的 cron 表达式: " + *req.CronExpr})
+			return
+		}
+		updates["cron_expr"] = *req.CronExpr
+		updates["next_run_at"] = nextRun
+	}
+	if req.TimeRangeType != nil {
+		updates["time_range_type"] = *req.TimeRangeType
+	}
+	if req.Sources != nil {
+		b, _ := json.Marshal(req.Sources)
+		updates["source_config"] = model.JSON(b)
+	}
+	if req.Participants != nil {
+		b, _ := json.Marshal(req.Participants)
+		updates["participant_config"] = model.JSON(b)
+	}
+
+	h.db.Model(&sched).Updates(updates)
+
+	var nextRunAt *string
+	if sched.NextRunAt != nil {
+		s := sched.NextRunAt.Format(time.RFC3339)
+		nextRunAt = &s
+	}
+
+	ok(c, gin.H{
+		"schedule_id": sched.ID,
+		"next_run_at": nextRunAt,
+	})
+}
+
+// DeleteSchedule handles DELETE /api/v1/summary-schedules/:id
+func (h *ScheduleHandler) DeleteSchedule(c *gin.Context) {
+	spaceID := middleware.GetSpaceID(c)
+	userID := middleware.GetUserID(c)
+	schedID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid schedule id"})
+		return
+	}
+
+	var sched model.SummarySchedule
+	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", schedID, spaceID).First(&sched).Error; err != nil {
+		bizErr(c, service.NewBizError(40008, "定时配置不存在", http.StatusNotFound))
+		return
+	}
+	if sched.CreatorID != userID {
+		bizErr(c, service.NewBizError(40004, "无权限删除", http.StatusForbidden))
+		return
+	}
+
+	now := time.Now().UTC()
+	h.db.Model(&sched).Update("deleted_at", &now)
+
+	ok(c, nil)
+}
+
+// ToggleSchedule handles PUT /api/v1/summary-schedules/:id/toggle
+func (h *ScheduleHandler) ToggleSchedule(c *gin.Context) {
+	spaceID := middleware.GetSpaceID(c)
+	userID := middleware.GetUserID(c)
+	schedID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid schedule id"})
+		return
+	}
+
+	var sched model.SummarySchedule
+	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", schedID, spaceID).First(&sched).Error; err != nil {
+		bizErr(c, service.NewBizError(40008, "定时配置不存在", http.StatusNotFound))
+		return
+	}
+	if sched.CreatorID != userID {
+		bizErr(c, service.NewBizError(40004, "无权限操作", http.StatusForbidden))
+		return
+	}
+
+	var req toggleScheduleReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: err.Error()})
+		return
+	}
+
+	updates := map[string]interface{}{}
+	if req.IsActive {
+		updates["is_active"] = 1
+		if sched.CronExpr != "" {
+			if nextRun, err := service.NextRun(sched.CronExpr, time.Now().UTC()); err == nil {
+				updates["next_run_at"] = nextRun
+			}
+		}
+	} else {
+		updates["is_active"] = 0
+	}
+
+	h.db.Model(&sched).Updates(updates)
+
+	ok(c, gin.H{
+		"schedule_id": sched.ID,
+		"is_active":   updates["is_active"],
+	})
+}
