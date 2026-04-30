@@ -60,21 +60,25 @@ func ResolveSourceNameWithType(sourceID string, sourceType int, imDB *gorm.DB) s
 	case 2: // thread
 		// Thread source_id format: {group_no}____{short_id}
 		// Note: For thread, ____ separates group_no and short_id; both are used
-		parts := strings.Split(sourceID, "____")
+		parts := strings.SplitN(sourceID, "____", 2)
 		if len(parts) == 2 {
 			groupNo := parts[0]
 			shortID := parts[1]
+			
 			var groupName string
-			if err := imDB.Table("group").Where("group_no = ?", groupNo).Pluck("name", &groupName).Error; err == nil && groupName != "" {
-				var threadName string
-				if err := imDB.Table("thread").Where("short_id = ?", shortID).Pluck("name", &threadName).Error; err == nil && threadName != "" {
-					return groupName + "-" + threadName + "(子区)"
-				}
-			}
-			// fallback: try thread name alone
+			_ = imDB.Table("group").Where("group_no = ?", groupNo).Pluck("name", &groupName).Error
+			
 			var threadName string
-			if err := imDB.Table("thread").Where("short_id = ?", shortID).Pluck("name", &threadName).Error; err == nil && threadName != "" {
+			_ = imDB.Table("thread").Where("short_id = ?", shortID).Pluck("name", &threadName).Error
+			
+			if groupName != "" && threadName != "" {
+				return groupName + "-" + threadName + "(子区)"
+			}
+			if threadName != "" {
 				return threadName + "(子区)"
+			}
+			if groupName != "" {
+				return groupName + "(子区)"
 			}
 		}
 	case 3: // DM (private chat)
