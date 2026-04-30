@@ -359,11 +359,23 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 
 	// Reduce phase
-	finalContent, reduceTokens, err := p.llm.CallReduce(ctx,
-		chunkSummaries, sourceName, startTime, endTime, targetMsgCount, task.Title,
-	)
-	if err != nil {
-		return "", nil, 0, 0, "", fmt.Errorf("reduce: %w", err)
+	var finalContent string
+	var reduceTokens int
+
+	if len(chunkSummaries) == 1 {
+		// Single chunk fast path: skip Reduce, use Map result directly
+		finalContent = chunkSummaries[0]
+		reduceTokens = 0
+		log.Printf("[pipeline] single chunk — skipping Reduce")
+	} else {
+		// Multiple chunks: execute Reduce to merge
+		var err error
+		finalContent, reduceTokens, err = p.llm.CallReduce(ctx,
+			chunkSummaries, sourceName, startTime, endTime, targetMsgCount, task.Title,
+		)
+		if err != nil {
+			return "", nil, 0, 0, "", fmt.Errorf("reduce: %w", err)
+		}
 	}
 	totalTokens += reduceTokens
 
