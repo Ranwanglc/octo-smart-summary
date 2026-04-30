@@ -92,6 +92,7 @@ func (imGroup) TableName() string { return "`group`" }
 type imDirect struct {
 	ChannelID string `gorm:"column:channel_id"`
 	Name      string `gorm:"column:name"`
+	Robot     int    `gorm:"column:robot"`
 }
 
 // SearchChatCandidates handles GET /api/v1/summary-chat-candidates
@@ -192,7 +193,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 	if (chatType == "" || chatType == "all" || chatType == "direct") && currentUIDStr != "" {
 		var directs []imDirect
 		q := h.imDB.Table("conversation_extra ce").
-			Select("ce.channel_id, u.name").
+			Select("ce.channel_id, u.name, u.robot").
 			Joins("LEFT JOIN user u ON ce.channel_id = u.uid").
 			Where("ce.uid = ? AND ce.channel_type = 1", currentUIDStr).
 			// Exclude known system accounts by name; creator_uid != '' in the robot
@@ -225,6 +226,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 				"chat_type":    "direct",
 				"name":         name,
 				"member_count": nil,
+				"is_bot":       d.Robot == 1,
 			})
 		}
 	}
