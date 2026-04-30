@@ -92,6 +92,7 @@ func (imGroup) TableName() string { return "`group`" }
 type imDirect struct {
 	ChannelID string `gorm:"column:channel_id"`
 	Name      string `gorm:"column:name"`
+	Robot     int    `gorm:"column:robot"`
 }
 
 // SearchChatCandidates handles GET /api/v1/summary-chat-candidates
@@ -192,25 +193,25 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 	if (chatType == "" || chatType == "all" || chatType == "direct") && currentUIDStr != "" {
 		var directs []imDirect
 		q := h.imDB.Table("conversation_extra ce").
-			Select("ce.channel_id, u.name").
+			Select("ce.channel_id, u.name, u.robot").
 			Joins("LEFT JOIN user u ON ce.channel_id = u.uid").
 			Where("ce.uid = ? AND ce.channel_type = 1", currentUIDStr).
 			// Exclude known system accounts by name; creator_uid != '' in the robot
 			// subquery is a catch-all that filters any unlisted system bots whose
 			// creator_uid is empty.
 			Where("ce.channel_id NOT IN ('fileHelper', 'botfather')").
-			// space_member filter is inside the human branch only — bots may not
-			// appear in space_member and must not be excluded by it.
+			// Both human and bot branches filter by space_member when a space is selected.
 			Where(`(
 				(LENGTH(ce.channel_id) = 32 AND u.robot = 0
 					AND (? = '' OR ce.channel_id IN (SELECT uid FROM space_member WHERE space_id = ? AND status = 1)))
 				OR
 				ce.channel_id IN (
 					SELECT f.to_uid FROM friend f
+					INNER JOIN space_member sm ON sm.uid = f.to_uid AND sm.status = 1 AND (? = '' OR sm.space_id = ?)
 					WHERE f.uid = ? AND f.is_deleted = 0
-					AND f.to_uid IN (SELECT robot_id FROM robot WHERE creator_uid != '')
+					AND f.to_uid IN (SELECT robot_id FROM robot WHERE creator_uid != '' AND status = 1)
 				)
-			)`, spaceIDStr, spaceIDStr, currentUIDStr)
+			)`, spaceIDStr, spaceIDStr, spaceIDStr, spaceIDStr, currentUIDStr)
 		if keyword != "" {
 			q = q.Where("u.name LIKE ?", "%"+keyword+"%")
 		}
@@ -225,6 +226,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 				"chat_type":    "direct",
 				"name":         name,
 				"member_count": nil,
+				"is_bot":       d.Robot == 1,
 			})
 		}
 	}
