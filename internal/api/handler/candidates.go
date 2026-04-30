@@ -200,18 +200,18 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 			// subquery is a catch-all that filters any unlisted system bots whose
 			// creator_uid is empty.
 			Where("ce.channel_id NOT IN ('fileHelper', 'botfather')").
-			// space_member filter is inside the human branch only — bots may not
-			// appear in space_member and must not be excluded by it.
+			// Both human and bot branches filter by space_member when a space is selected.
 			Where(`(
 				(LENGTH(ce.channel_id) = 32 AND u.robot = 0
 					AND (? = '' OR ce.channel_id IN (SELECT uid FROM space_member WHERE space_id = ? AND status = 1)))
 				OR
 				ce.channel_id IN (
 					SELECT f.to_uid FROM friend f
+					INNER JOIN space_member sm ON sm.uid = f.to_uid AND sm.status = 1 AND (? = '' OR sm.space_id = ?)
 					WHERE f.uid = ? AND f.is_deleted = 0
-					AND f.to_uid IN (SELECT robot_id FROM robot WHERE creator_uid != '')
+					AND f.to_uid IN (SELECT robot_id FROM robot WHERE creator_uid != '' AND status = 1)
 				)
-			)`, spaceIDStr, spaceIDStr, currentUIDStr)
+			)`, spaceIDStr, spaceIDStr, spaceIDStr, spaceIDStr, currentUIDStr)
 		if keyword != "" {
 			q = q.Where("u.name LIKE ?", "%"+keyword+"%")
 		}
