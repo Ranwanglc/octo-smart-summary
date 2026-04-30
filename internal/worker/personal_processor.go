@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
+
+const noRelevantContentMessage = "在当前范围内未找到与主题相关的聊天记录。"
 
 func (p *Processor) processPersonalSummary(ctx context.Context, taskID, participantRefID int64) {
 	log.Printf("[personal-worker] start task=%d participant=%d", taskID, participantRefID)
@@ -61,6 +64,9 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 		log.Printf("[personal-worker] pipeline error task=%d user=%s: %v", taskID, participant.UserID, err)
 		p.markPersonalFailed(&pr, &participant, err.Error())
 		return
+	}
+	if strings.TrimSpace(content) == "" {
+		content = noRelevantContentMessage
 	}
 
 	// Mark completed
@@ -170,7 +176,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// Apply context window filter
 	userMessages := pipeline.FilterWithContext(messages, userID, p.cfg.ContextWindow)
 	if len(userMessages) == 0 {
-		return "", nil, 0, 0, "", nil
+		return noRelevantContentMessage, nil, 0, 0, p.llm.ModelVersion(), nil
 	}
 
 	// Resolve sender names
