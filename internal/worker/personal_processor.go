@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -12,6 +13,10 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"gorm.io/gorm"
 )
+
+func escapeCitationMarkers(content string) string {
+	return citationRe.ReplaceAllString(content, "($1)")
+}
 
 const noRelevantContentMessage = "在当前范围内未找到与主题相关的聊天记录。"
 
@@ -216,6 +221,8 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 }
 
 func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string) (string, []model.Citation, int, int, string, error) {
+	totalStart := time.Now()
+
 	// Load sources
 	var sources []model.SummarySource
 	if err := p.db.Where("task_id = ?", task.ID).Find(&sources).Error; err != nil {
@@ -238,20 +245,26 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	messages, err := pipeline.ResolveAndFetchMessagesForPersonal(
 		ctx, userID, nil, nil, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
-		p.imDB, llmFn, p.cfg.MsgTableCount,
+		p.imDB, llmFn, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
 	)
 	if err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("fetch messages: %w", err)
 	}
 
 	// Apply context window filter
+	filterStart := time.Now()
 	userMessages := pipeline.FilterWithContext(messages, userID, p.cfg.ContextWindow)
+	log.Printf("[personal-worker] FilterWithContext took %dms (%d → %d messages)",
+		time.Since(filterStart).Milliseconds(), len(messages), len(userMessages))
 	if len(userMessages) == 0 {
 		return noRelevantContentMessage, nil, 0, 0, p.llm.ModelVersion(), nil
 	}
 
 	// Resolve sender names
+	resolveStart := time.Now()
 	nameMap := p.batchResolveUserNames(messages)
+	log.Printf("[personal-worker] batchResolveUserNames took %dms (%d names)",
+		time.Since(resolveStart).Milliseconds(), len(nameMap))
 	for i := range userMessages {
 		if name, ok := nameMap[userMessages[i].SenderUID]; ok {
 			userMessages[i].SenderName = name
@@ -308,6 +321,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	if len(currentChunk) > 0 {
 		chunks = append(chunks, currentChunk)
 	}
+	log.Printf("[personal-worker] Chunking: %d messages → %d chunks (maxTokens=%d)",
+		len(userMessages), len(chunks), effectiveMax)
 
 	startTime := task.TimeRangeStart.Format("2006-01-02 15:04")
 	endTime := task.TimeRangeEnd.Format("2006-01-02 15:04")
@@ -321,40 +336,77 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		userName = userID
 	}
 
-	// Map phase
+	// Map phase（并发）
+	type chunkResult struct {
+		summary string
+		tokens  int
+		failed  bool
+	}
+
+	concurrency := p.cfg.WorkerMapConcurrency
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
+	results := make([]chunkResult, len(chunks))
+	mapSem := make(chan struct{}, concurrency)
+	var mapWg sync.WaitGroup
+
+	mapStart := time.Now()
+	for i, chunk := range chunks {
+		mapWg.Add(1)
+		go func(idx int, c []pipeline.Message) {
+			defer mapWg.Done()
+
+			select {
+			case mapSem <- struct{}{}:
+			case <-ctx.Done():
+				results[idx] = chunkResult{failed: true}
+				return
+			}
+			defer func() { <-mapSem }()
+
+			var formatted []string
+			for _, m := range c {
+				formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
+					m.CitationIndex, m.SendTime, m.SenderName,
+					escapeCitationMarkers(m.Content)))
+			}
+
+			summary, tokens, err := p.llm.CallMap(ctx,
+				joinStrings(formatted), sourceName, idx, len(c),
+				startTime, endTime, task.Title, userName,
+			)
+			if err != nil {
+				log.Printf("[personal-worker] Map chunk %d failed: %v", idx, err)
+				results[idx] = chunkResult{failed: true}
+			} else {
+				results[idx] = chunkResult{summary: summary, tokens: tokens}
+			}
+		}(i, chunk)
+	}
+	mapWg.Wait()
+	log.Printf("[personal-worker] Map phase took %dms (%d chunks, concurrency=%d)",
+		time.Since(mapStart).Milliseconds(), len(chunks), concurrency)
+
+	if ctx.Err() != nil {
+		return "", nil, 0, 0, "", fmt.Errorf("map phase cancelled: %w", ctx.Err())
+	}
+
 	var chunkSummaries []string
 	var totalTokens int
-	for i, chunk := range chunks {
-		var formatted []string
-		for _, m := range chunk {
-			formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
-				m.CitationIndex, m.SendTime, m.SenderName, m.Content))
-		}
-
-		summary, tokens, err := p.llm.CallMap(ctx,
-			joinStrings(formatted), sourceName, i, len(chunk),
-			startTime, endTime, task.Title, userName,
-		)
-		if err != nil {
-			return "", nil, 0, 0, "", fmt.Errorf("map chunk %d: %w", i, err)
-		}
-		chunkSummaries = append(chunkSummaries, summary)
-		totalTokens += tokens
-	}
-
-	// Detect all-chunks-failed
-	allFailed := true
-	for _, s := range chunkSummaries {
-		if !strings.Contains(s, service.MapFailedMarker) {
-			allFailed = false
-			break
+	for _, r := range results {
+		if !r.failed && !strings.Contains(r.summary, service.MapFailedMarker) {
+			chunkSummaries = append(chunkSummaries, r.summary)
+			totalTokens += r.tokens
 		}
 	}
-	if allFailed && len(chunkSummaries) > 0 {
-		return "", nil, 0, 0, "", fmt.Errorf("all %d chunk(s) failed during Map phase (LLM unreachable)", len(chunkSummaries))
+	if len(chunkSummaries) == 0 && len(results) > 0 {
+		return "", nil, 0, 0, "", fmt.Errorf("all %d chunk(s) failed during Map phase (LLM unreachable)", len(results))
 	}
 
 	// Reduce phase
+	reduceStart := time.Now()
 	var finalContent string
 	var reduceTokens int
 
@@ -374,10 +426,18 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		}
 	}
 	totalTokens += reduceTokens
+	log.Printf("[personal-worker] Reduce phase took %dms", time.Since(reduceStart).Milliseconds())
 
 	// Build citations from final content
+	citationStart := time.Now()
 	citations := buildCitations(finalContent, userMessages, messages, nameMap)
 	finalContent, citations = dedupCitations(finalContent, citations)
+	finalContent = stripOrphanCitations(finalContent, citations)
+	log.Printf("[personal-worker] Citation build took %dms (%d citations)",
+		time.Since(citationStart).Milliseconds(), len(citations))
+
+	log.Printf("[personal-worker] Total executePersonalPipeline took %dms",
+		time.Since(totalStart).Milliseconds())
 
 	return finalContent, citations, targetMsgCount, totalTokens, p.llm.ModelVersion(), nil
 }

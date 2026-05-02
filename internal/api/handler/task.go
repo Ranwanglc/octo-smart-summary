@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -139,6 +140,14 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	}
 
 	// Validate
+	if utf8.RuneCountInString(req.Title) > 500 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 500 字符"})
+		return
+	}
+	if utf8.RuneCountInString(req.Topic) > 500 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 500 字符"})
+		return
+	}
 	if len(req.Sources) == 0 && req.Topic == "" && req.TimeRange == nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "至少提供 sources、topic 或 time_range 之一"})
 		return

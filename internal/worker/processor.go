@@ -278,7 +278,7 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 	messages, err = pipeline.ResolveAndFetchMessagesForPersonal(
 		ctx, task.CreatorID, participantUIDs, participantNames, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
-		p.imDB, llmFn, p.cfg.MsgTableCount,
+		p.imDB, llmFn, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
 	)
 	if err != nil {
 		return fmt.Errorf("fetch messages: %w", err)
