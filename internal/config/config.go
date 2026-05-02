@@ -45,6 +45,7 @@ type Config struct {
 	// Context window for personal summary filtering
 	ContextWindow             int
 	MaxMessagesPerParticipant int
+	MaxMessagesPerChannel     int
 	MapMaxTokens              int
 	CharsPerTokenCJK          int
 	CharsPerTokenASCII        int
@@ -54,6 +55,9 @@ type Config struct {
 
 	// Candidate search query limit (-1 = no limit, >0 = use as SQL LIMIT)
 	CandidateQueryLimit int
+
+	// Fetch concurrency for parallel channel message retrieval
+	FetchConcurrency int
 }
 
 func Load() *Config {
@@ -86,6 +90,7 @@ func Load() *Config {
 
 		ContextWindow:             envInt("CONTEXT_WINDOW", 2),
 		MaxMessagesPerParticipant: envInt("MAX_MESSAGES_PER_PARTICIPANT", 5000),
+		MaxMessagesPerChannel:     envInt("MAX_MESSAGES_PER_CHANNEL", -1),
 		MapMaxTokens:             envInt("MAP_MAX_TOKENS", 0),
 		CharsPerTokenCJK:         envInt("CHARS_PER_TOKEN_CJK", 1),
 		CharsPerTokenASCII:       envInt("CHARS_PER_TOKEN_ASCII", 4),
@@ -93,6 +98,8 @@ func Load() *Config {
 		WorkerTriggerURL: envStr("WORKER_TRIGGER_URL", ""),
 
 		CandidateQueryLimit: envInt("SUMMARY_CHAT_CANDIDATE_LIMIT", -1),
+
+		FetchConcurrency: envInt("FETCH_CONCURRENCY", 10),
 	}
 }
 

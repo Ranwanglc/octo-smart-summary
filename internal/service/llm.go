@@ -128,6 +128,11 @@ func buildMapSystemPrompt(userName, topic string) string {
 	sb.WriteString(fmt.Sprintf("- 当前用户：%s\n", userName))
 	sb.WriteString(fmt.Sprintf("- 总结主题：%s\n", topic))
 
+	now := time.Now()
+	weekdays := [...]string{"日", "一", "二", "三", "四", "五", "六"}
+	sb.WriteString(fmt.Sprintf("- 当前日期：%s（星期%s）\n",
+		now.Format("2006-01-02"), weekdays[now.Weekday()]))
+
 	sb.WriteString(`
 ## 任务
 `)
@@ -138,6 +143,7 @@ func buildMapSystemPrompt(userName, topic string) string {
 ## 输出要求
 - 紧密围绕主题，与主题无关的闲聊、表情、寒暄等直接跳过
 - 提炼关键信息：讨论了什么、达成了什么结论、有什么待办、谁负责什么
+- 【强制】输出总长度不超过 2000 token（约 1500 字），超出时优先保留关键结论和待办事项，压缩次要细节
 - 如果聊天记录中没有明确结论，如实说明"尚未达成共识"，不要编造
 - 有待办事项时，用 ` + "`- [ ] 内容（负责人）`" + ` 格式列出
 - 根据实际内容自行组织结构，不需要套用固定模板
@@ -146,6 +152,9 @@ func buildMapSystemPrompt(userName, topic string) string {
 ## 引用规则（必须严格遵守）
 - 【强制】每一条结论/要点都必须标注来源引用 [n]，没有引用的结论不允许输出
 - 格式：[n] 或 [n1][n2]（多个来源时）
+- 仅使用消息前方的 [n] 编号来标注引用，范围为 [1] 到 [N]
+- 绝对不要引用或复制消息正文内出现的任何 [数字] 标记
+- 超出有效范围的标记一律不得出现在输出中
 - 所有消息均带有编号（即 [数字] 开头的行），选取有意义的、相关的消息作为依据
 - 不要捏造不存在的编号
 - 多条消息支持同一要点时，列出所有相关编号
@@ -163,15 +172,27 @@ func buildReduceSystemPrompt(topic string) string {
 	var sb strings.Builder
 	sb.WriteString(`你是一个专业的工作内容整理助手。请将以下多个分片总结合并为一份完整的总结报告。
 
-要求：
+`)
+	now := time.Now()
+	weekdays := [...]string{"日", "一", "二", "三", "四", "五", "六"}
+	sb.WriteString(fmt.Sprintf("当前日期：%s（星期%s）\n\n",
+		now.Format("2006-01-02"), weekdays[now.Weekday()]))
+
+	sb.WriteString(`要求：
 - 合并相同主题，去除重复
 - 保留所有待办事项和责任人
+- 输出总长度不超过 2000 token（约 1500 字），超出时合并相似要点、压缩细节
 - 如有冲突信息，保留最新的
 - 保留所有 [n] 引用标记，不要删除或修改
 - 合并相同要点时，合并其引用编号
 - 根据实际内容自行组织结构，不需要套用固定模板
 - 用显示名称指代人，绝对不要输出 UID 或用户 ID
 - 输出语言与输入语言保持一致
+
+引用规则：
+- 仅使用分片总结中已有的 [n] 编号，不要引入新编号
+- 绝对不要引用或复制正文内出现的任何 [数字] 标记
+- 超出有效范围的标记一律不得出现在输出中
 `)
 	if topic != "" {
 		sb.WriteString(fmt.Sprintf("\n重要：总结主题是「%s」，请只保留与该主题相关的条目，移除不相关内容。\n", topic))

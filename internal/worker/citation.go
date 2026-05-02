@@ -11,9 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
-// citationRe matches [n] citation markers (1-3 digits). Markdown links [text](url)
-// are not false-matched because link text is never pure digits.
-var citationRe = regexp.MustCompile(`\[(\d{1,3})\]`)
+var citationRe = regexp.MustCompile(`\[(\d{1,5})\]`)
 var multiSpaceRe = regexp.MustCompile(`[ \t]{2,}`)
 var emptyLineRe = regexp.MustCompile(`(?m)^[ \t]*$\n`)
 
@@ -42,12 +40,30 @@ func buildCitations(text string, messages []pipeline.Message, allMessages []pipe
 		return []model.Citation{}
 	}
 
+	maxIdx := 0
+	for _, msg := range messages {
+		if msg.CitationIndex > maxIdx {
+			maxIdx = msg.CitationIndex
+		}
+	}
+	var validIndexes []int
+	for _, idx := range indexes {
+		if idx >= 1 && idx <= maxIdx {
+			validIndexes = append(validIndexes, idx)
+		}
+	}
+	indexes = validIndexes
+	if len(indexes) == 0 {
+		return []model.Citation{}
+	}
+
 	indexSet := make(map[int]bool, len(indexes))
 	for _, idx := range indexes {
 		indexSet[idx] = true
 	}
 
 	channelMsgMap := buildChannelMessageMap(allMessages)
+	seqIndexMap := buildSeqIndexMap(channelMsgMap)
 
 	var citations []model.Citation
 	for _, msg := range messages {
@@ -61,7 +77,7 @@ func buildCitations(text string, messages []pipeline.Message, allMessages []pipe
 				}
 			}
 
-			before, after := findContext(msg, channelMsgMap, nameMap, 3)
+			before, after := findContextFast(msg, channelMsgMap, seqIndexMap, nameMap, 3)
 
 			citations = append(citations, model.Citation{
 				Index:         msg.CitationIndex,
@@ -97,6 +113,53 @@ func buildChannelMessageMap(allMessages []pipeline.Message) map[string][]pipelin
 		m[msg.ChannelID] = append(m[msg.ChannelID], msg)
 	}
 	return m
+}
+
+func buildSeqIndexMap(channelMsgMap map[string][]pipeline.Message) map[string]map[int64]int {
+	result := make(map[string]map[int64]int, len(channelMsgMap))
+	for chID, msgs := range channelMsgMap {
+		idx := make(map[int64]int, len(msgs))
+		for i, m := range msgs {
+			idx[m.MessageSeq] = i
+		}
+		result[chID] = idx
+	}
+	return result
+}
+
+func findContextFast(target pipeline.Message, channelMsgMap map[string][]pipeline.Message, seqIndexMap map[string]map[int64]int, nameMap map[string]string, n int) ([]model.ContextMsg, []model.ContextMsg) {
+	channelMsgs, ok := channelMsgMap[target.ChannelID]
+	if !ok {
+		return nil, nil
+	}
+	seqIdx, ok := seqIndexMap[target.ChannelID]
+	if !ok {
+		return nil, nil
+	}
+	targetIdx, ok := seqIdx[target.MessageSeq]
+	if !ok {
+		return nil, nil
+	}
+
+	var before []model.ContextMsg
+	start := targetIdx - n
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < targetIdx; i++ {
+		before = append(before, toContextMsg(channelMsgs[i], nameMap))
+	}
+
+	var after []model.ContextMsg
+	end := targetIdx + n + 1
+	if end > len(channelMsgs) {
+		end = len(channelMsgs)
+	}
+	for i := targetIdx + 1; i < end; i++ {
+		after = append(after, toContextMsg(channelMsgs[i], nameMap))
+	}
+
+	return before, after
 }
 
 func findContext(target pipeline.Message, channelMsgMap map[string][]pipeline.Message, nameMap map[string]string, n int) ([]model.ContextMsg, []model.ContextMsg) {
@@ -291,4 +354,20 @@ func isOnlyWhitespace(s string) bool {
 		}
 	}
 	return true
+}
+
+func stripOrphanCitations(text string, citations []model.Citation) string {
+	validSet := make(map[int]bool)
+	for _, c := range citations {
+		validSet[c.Index] = true
+	}
+	result := citationRe.ReplaceAllStringFunc(text, func(match string) string {
+		sub := citationRe.FindStringSubmatch(match)
+		n, _ := strconv.Atoi(sub[1])
+		if validSet[n] {
+			return match
+		}
+		return ""
+	})
+	return strings.TrimSpace(multiSpaceRe.ReplaceAllString(result, " "))
 }

@@ -7,6 +7,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -242,6 +243,8 @@ func NarrowByTopic(ctx context.Context, topic string, candidates []ChannelInfo, 
 		return candidates
 	}
 
+	topic = sanitizeTopic(topic)
+
 	var lines []string
 	for _, c := range candidates {
 		lines = append(lines, fmt.Sprintf("- %s: %s", c.ChannelID, c.ChannelName))
@@ -280,7 +283,8 @@ func NarrowByTopic(ctx context.Context, topic string, candidates []ChannelInfo, 
 
 // FetchMessagesFromChannel fetches text messages from a sharded table. (Layer 4)
 // selfUID is used to normalize DM channel IDs to the storage format.
-func FetchMessagesFromChannel(ctx context.Context, channelID string, channelType int, startTS, endTS int64, imDB *gorm.DB, tableCount int, selfUID string) ([]Message, error) {
+// maxPerChannel: <=0 means fetch up to maxSafetyLimit; >0 = fetch latest N.
+func FetchMessagesFromChannel(ctx context.Context, channelID string, channelType int, startTS, endTS int64, imDB *gorm.DB, tableCount int, selfUID string, maxPerChannel int) ([]Message, error) {
 	if imDB == nil {
 		return nil, fmt.Errorf("IM database not available")
 	}
@@ -290,6 +294,17 @@ func FetchMessagesFromChannel(ctx context.Context, channelID string, channelType
 		return nil, fmt.Errorf("invalid table name: %s", table)
 	}
 
+	const maxSafetyLimit = 100000
+
+	effectiveMax := maxPerChannel
+	if effectiveMax <= 0 {
+		effectiveMax = maxSafetyLimit
+	}
+	if effectiveMax > maxSafetyLimit {
+		log.Printf("[pipeline] WARN: maxPerChannel=%d exceeds safety limit, capping to %d", effectiveMax, maxSafetyLimit)
+		effectiveMax = maxSafetyLimit
+	}
+
 	type msgRow struct {
 		MessageSeq int64  `gorm:"column:message_seq"`
 		FromUID    string `gorm:"column:from_uid"`
@@ -297,18 +312,22 @@ func FetchMessagesFromChannel(ctx context.Context, channelID string, channelType
 		Timestamp  int64  `gorm:"column:timestamp"`
 		Payload    []byte `gorm:"column:payload"`
 	}
-	var rows []msgRow
+
+	var allRows []msgRow
 
 	query := fmt.Sprintf(
-		"SELECT message_seq, from_uid, channel_id, `timestamp`, payload FROM `%s` WHERE channel_id = ? AND channel_type = ? AND `timestamp` BETWEEN ? AND ? AND is_deleted = 0 ORDER BY message_seq ASC LIMIT 5000",
+		"SELECT message_seq, from_uid, channel_id, `timestamp`, payload FROM `%s` WHERE channel_id = ? AND channel_type = ? AND `timestamp` BETWEEN ? AND ? AND is_deleted = 0 ORDER BY message_seq DESC LIMIT ?",
 		table,
 	)
-	if err := imDB.WithContext(ctx).Raw(query, channelID, channelType, startTS, endTS).Scan(&rows).Error; err != nil {
+	if err := imDB.WithContext(ctx).Raw(query, channelID, channelType, startTS, endTS, effectiveMax).Scan(&allRows).Error; err != nil {
 		return nil, fmt.Errorf("fetch messages from %s: %w", table, err)
+	}
+	for i, j := 0, len(allRows)-1; i < j; i, j = i+1, j-1 {
+		allRows[i], allRows[j] = allRows[j], allRows[i]
 	}
 
 	var messages []Message
-	for _, r := range rows {
+	for _, r := range allRows {
 		text, ok := ExtractText(r.Payload)
 		if !ok {
 			continue
@@ -322,6 +341,9 @@ func FetchMessagesFromChannel(ctx context.Context, channelID string, channelType
 			Content:    text,
 		})
 	}
+
+	log.Printf("[pipeline-personal] FetchMessagesFromChannel %s: %d rows fetched (maxPerChannel=%d)",
+		channelID, len(messages), maxPerChannel)
 	return messages, nil
 }
 
@@ -523,52 +545,104 @@ func FilterMessagesByRelevance(messages []Message, topic string, participantUIDs
 
 // ResolveAndFetchMessagesForPersonal runs the pipeline with participant-aware
 // filtering: Layer 1.5 (channel intersection) and Layer 4.5 (mutual activity).
-func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, llmFn LLMCallFn, tableCount int) ([]Message, error) {
+func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int) ([]Message, error) {
 	if timeEnd.Sub(timeStart) > 31*24*time.Hour {
 		return nil, fmt.Errorf("时间范围不能超过 31 天")
 	}
+
+	pipelineStart := time.Now()
+
+	// Layer 0: Pre-Retrieval Narrow
+	narrowCtx, narrowCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer narrowCancel()
+	timeStart, timeEnd = PreRetrievalNarrow(narrowCtx, topic, timeStart, timeEnd, llmFn)
 
 	startTS := timeStart.Unix()
 	endTS := timeEnd.Unix()
 
 	// Layer 1: channel discovery
+	l1Start := time.Now()
 	userChannels, err := GetUserChannels(ctx, creatorUID, imDB)
 	if err != nil {
 		return nil, fmt.Errorf("channel discovery: %w", err)
 	}
-	log.Printf("[pipeline-personal] Layer 1: discovered %d channels for creator", len(userChannels))
+	log.Printf("[pipeline-personal] Layer 1 (channel discovery) took %dms (%d channels)",
+		time.Since(l1Start).Milliseconds(), len(userChannels))
 
 	// Layer 1.5: intersect with participant channels
+	l15Start := time.Now()
 	userChannels, err = IntersectParticipantChannels(ctx, userChannels, participantUIDs, imDB)
 	if err != nil {
 		return nil, fmt.Errorf("intersect participant channels: %w", err)
 	}
-	log.Printf("[pipeline-personal] Layer 1.5: %d channels after participant intersection", len(userChannels))
+	log.Printf("[pipeline-personal] Layer 1.5 (participant intersect) took %dms (%d channels)",
+		time.Since(l15Start).Milliseconds(), len(userChannels))
 
 	// Layer 2: source constraints
+	l2Start := time.Now()
 	candidates := ApplySourceConstraints(userChannels, specifiedSources, creatorUID)
+	log.Printf("[pipeline-personal] Layer 2 (source constraints) took %dms (%d → %d candidates)",
+		time.Since(l2Start).Milliseconds(), len(userChannels), len(candidates))
 
-	log.Printf("[pipeline-personal] Layer 2: %d candidate channels", len(candidates))
+	// Layer 4: message fetching（并发）
+	fetchStart := time.Now()
+	if fetchConcurrency <= 0 {
+		fetchConcurrency = 10
+	}
 
-	// Layer 4: message fetching
-	var allMessages []Message
+	type fetchResult struct {
+		msgs []Message
+		err  error
+		ch   ChannelInfo
+	}
+
+	resultsCh := make(chan fetchResult, len(candidates))
+	sem := make(chan struct{}, fetchConcurrency)
+	var wg sync.WaitGroup
+
 	for _, ch := range candidates {
-		msgs, err := FetchMessagesFromChannel(ctx, ch.ChannelID, ch.ChannelType, startTS, endTS, imDB, tableCount, creatorUID)
-		if err != nil {
-			log.Printf("[pipeline-personal] fetch from %s error: %v", ch.ChannelID, err)
+		wg.Add(1)
+		go func(channel ChannelInfo) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				resultsCh <- fetchResult{nil, ctx.Err(), channel}
+				return
+			}
+			defer func() { <-sem }()
+			msgs, err := FetchMessagesFromChannel(ctx, channel.ChannelID, channel.ChannelType, startTS, endTS, imDB, tableCount, creatorUID, maxPerChannel)
+			if err == nil {
+				for i := range msgs {
+					msgs[i].SourceName = channel.ChannelName
+					msgs[i].ChannelType = channel.ChannelType
+				}
+			}
+			resultsCh <- fetchResult{msgs, err, channel}
+		}(ch)
+	}
+	wg.Wait()
+	close(resultsCh)
+
+	var allMessages []Message
+	for r := range resultsCh {
+		if r.err != nil {
+			log.Printf("[pipeline-personal] fetch from %s error: %v", r.ch.ChannelID, r.err)
 			continue
 		}
-		for i := range msgs {
-			msgs[i].SourceName = ch.ChannelName
-			msgs[i].ChannelType = ch.ChannelType
-		}
-		allMessages = append(allMessages, msgs...)
+		allMessages = append(allMessages, r.msgs...)
 	}
-	log.Printf("[pipeline-personal] Layer 4: fetched %d messages", len(allMessages))
+	sort.Slice(allMessages, func(i, j int) bool {
+		if allMessages[i].ChannelID != allMessages[j].ChannelID {
+			return allMessages[i].ChannelID < allMessages[j].ChannelID
+		}
+		return allMessages[i].MessageSeq < allMessages[j].MessageSeq
+	})
+	log.Printf("[pipeline-personal] Layer 4: fetched %d messages from %d channels in %dms",
+		len(allMessages), len(candidates), time.Since(fetchStart).Milliseconds())
 
 	// Layer 4.5: mutual activity filter
-	// Only skip filter for DM-only sources (source_type=3)
-	// Group sources (source_type=1) still need mutual activity filtering
+	l45Start := time.Now()
 	onlyDMSources := len(specifiedSources) > 0
 	for _, s := range specifiedSources {
 		st := 0
@@ -586,8 +660,15 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 		log.Printf("[pipeline-personal] Layer 4.5: skipped (DM-only sources)")
 	} else {
 		allMessages = FilterByMutualActivity(allMessages, creatorUID, participantUIDs)
-		log.Printf("[pipeline-personal] Layer 4.5: %d messages after mutual activity filter", len(allMessages))
+		log.Printf("[pipeline-personal] Layer 4.5 (mutual activity) took %dms (%d messages)",
+			time.Since(l45Start).Milliseconds(), len(allMessages))
 	}
+
+	// Layer 5: Post-Retrieval Narrow
+	allMessages = PostRetrievalNarrow(ctx, allMessages, topic, llmFn)
+
+	log.Printf("[pipeline-personal] Total pipeline took %dms (%d messages final)",
+		time.Since(pipelineStart).Milliseconds(), len(allMessages))
 
 	return allMessages, nil
 }
