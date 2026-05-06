@@ -272,9 +272,16 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	// Apply context window filter (signature changed: userID → targetUIDs)
 	filterStart := time.Now()
-	userMessages := pipeline.FilterWithContext(messages, targetUIDs, p.cfg.ContextWindow)
-	log.Printf("[personal-worker] FilterWithContext took %dms (%d → %d messages, targets=%v)",
-		time.Since(filterStart).Milliseconds(), len(messages), len(userMessages), targetUIDs)
+	var userMessages []pipeline.Message
+	if len(targetUIDs) > 0 {
+		userMessages = pipeline.FilterWithContext(messages, targetUIDs, p.cfg.ContextWindow)
+		log.Printf("[personal-worker] FilterWithContext took %dms (%d → %d messages, targets=%v)",
+			time.Since(filterStart).Milliseconds(), len(messages), len(userMessages), targetUIDs)
+	} else {
+		userMessages = messages
+		log.Printf("[personal-worker] no specific target, using all %d messages (took %dms)",
+			len(messages), time.Since(filterStart).Milliseconds())
+	}
 	if len(userMessages) == 0 {
 		return noRelevantContentMessage, nil, 0, 0, p.llm.ModelVersion(), nil
 	}

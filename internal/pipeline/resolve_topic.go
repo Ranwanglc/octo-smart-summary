@@ -14,9 +14,10 @@ import (
 
 // TopicResolveResult is the structured output from topic target resolution.
 type TopicResolveResult struct {
-	HasTarget bool     `json:"has_target"`
-	UIDs      []string `json:"uids"`
-	Reasoning string   `json:"reasoning"`
+	HasTarget   bool     `json:"has_target"`
+	UIDs        []string `json:"uids"`
+	IncludeSelf bool     `json:"include_self"`
+	Reasoning   string   `json:"reasoning"`
 }
 
 var resolveTopicTargetTool = service.Tool{
@@ -34,24 +35,28 @@ var resolveTopicTargetTool = service.Tool{
 				"uids": map[string]interface{}{
 					"type":        "array",
 					"items":       map[string]interface{}{"type": "string"},
-					"description": "目标成员的 UID 列表。has_target 为 false 时为空数组",
+					"description": "目标成员的 UID 列表。只能从成员列表中选取 UID 原文，不得编造或推测。has_target 为 false 时为空数组",
 				},
 				"reasoning": map[string]interface{}{
 					"type":        "string",
 					"description": "一句话解释判断依据",
 				},
+				"include_self": map[string]interface{}{
+					"type":        "boolean",
+					"description": "主题中创建者以第一人称作为对话参与者出现时为 true（如'我和Jeff聊了什么'、'我跟团队讨论的内容'）；只关注他人时为 false（如'辉哥的发言'、'Jeff和Thomas的讨论'）",
+				},
 			},
-			"required": []string{"has_target", "uids", "reasoning"},
+			"required": []string{"has_target", "uids", "include_self", "reasoning"},
 		},
 	},
 }
 
 // ResolveTopicTarget uses LLM Function Call to semantically resolve the target person
 // referenced in the topic. Returns targetUIDs for FilterWithContext.
-// Falls back to []string{defaultUID} when topic has no target or on any failure.
+// Returns nil when topic has no specific target or on any failure (caller skips filter).
 func ResolveTopicTarget(ctx context.Context, topic string, nameMap map[string]string, defaultUID string, toolCallFn LLMToolCallFn) []string {
 	if topic == "" || toolCallFn == nil {
-		return []string{defaultUID}
+		return nil
 	}
 
 	type member struct {
@@ -65,7 +70,7 @@ func ResolveTopicTarget(ctx context.Context, topic string, nameMap map[string]st
 		}
 	}
 	if len(members) == 0 {
-		return []string{defaultUID}
+		return nil
 	}
 
 	sort.Slice(members, func(i, j int) bool {
@@ -84,11 +89,21 @@ func ResolveTopicTarget(ctx context.Context, topic string, nameMap map[string]st
 规则：
 - 主题是关于某个特定成员的内容（如"辉哥的发言"、"CTO的观点"），返回该成员 UID
 - 主题包含多个人（如"辉哥和小明的讨论"），返回所有相关成员的 UID
-- 主题是自我指代（如"我的工作"），has_target 为 false
-- 主题不涉及特定人物（如"项目进度"），has_target 为 false
-- 主题中提到的人物不在成员列表中，has_target 为 false
-- 只返回确定的匹配，不要猜测
-- 支持昵称、简称、职位等间接引用
+- 主题是自我指代（如"我的工作"、"我说了什么"），has_target 为 true，uids 为空数组，include_self 为 true
+- 主题不涉及特定人物（如"项目进度"、"最近在聊什么"），has_target 为 false
+- uids 只能从成员列表中选取，不得编造或推测不存在的 UID
+- 主题中提到的人物在成员列表中找不到匹配时，忽略该人物；所有人物都找不到时，has_target 为 false（此规则不影响"我"的处理——"我"始终通过 include_self 标识，不需要出现在成员列表中）
+- 名字匹配支持语义关联：昵称、简称、姓氏称呼、职位等，但必须与成员姓名存在明确的语义关联（如包含关系、谐音、常见缩写）
+- 两个名字之间没有语义关联时，不算匹配
+- 主题中"我"作为对话参与者出现（如"我和Jeff聊了什么"、"我跟团队讨论的内容"），include_self 为 true
+- 主题只关注他人的内容（如"辉哥的发言"、"Jeff和Thomas的讨论"），include_self 为 false
+
+示例：
+  ✅ "辉哥" → "李光辉"（辉 是 光辉 的简称，语义关联明确）
+  ✅ "老王" → "王建国"（老+姓氏 = 常见称呼方式）
+  ✅ "Thomas" → "托马斯"（同一名字的中英文形式）
+  ❌ "Jeff" → "Angie"（两个名字之间没有任何语义关联）
+  ❌ "小明" → "张伟"（没有语义关联，即使只有这一个成员）
 
 你必须调用 resolve_topic_target 工具来返回结果，不要以文本形式回复。`
 
@@ -113,21 +128,31 @@ func ResolveTopicTarget(ctx context.Context, topic string, nameMap map[string]st
 	elapsed := time.Since(start).Milliseconds()
 
 	if err != nil {
-		log.Printf("[pipeline] CallWithTools: tool=resolve_topic_target input={topic:%q, members:%d} took %dms error=%v, fallback to creator", topicSafe, len(members), elapsed, err)
-		return []string{defaultUID}
+		log.Printf("[pipeline] CallWithTools: tool=resolve_topic_target input={topic:%q, members:%d} took %dms error=%v, fallback to no target", topicSafe, len(members), elapsed, err)
+		return nil
 	}
 
 	var parsed TopicResolveResult
 	if err := json.Unmarshal([]byte(argsJSON), &parsed); err != nil {
-		log.Printf("[pipeline] CallWithTools: tool=resolve_topic_target input={topic:%q, members:%d} took %dms parse_error=%v, args=%s, fallback to creator", topicSafe, len(members), elapsed, err, argsJSON)
-		return []string{defaultUID}
+		log.Printf("[pipeline] CallWithTools: tool=resolve_topic_target input={topic:%q, members:%d} took %dms parse_error=%v, args=%s, fallback to no target", topicSafe, len(members), elapsed, err, argsJSON)
+		return nil
 	}
 
 	log.Printf("[pipeline] CallWithTools: tool=resolve_topic_target input={topic:%q, members:%d} took %dms result={has_target:%v, uids:%v}", topicSafe, len(members), elapsed, parsed.HasTarget, parsed.UIDs)
 
-	if !parsed.HasTarget || len(parsed.UIDs) == 0 {
+	if !parsed.HasTarget {
 		log.Printf("[pipeline] ResolveTopicTarget: no target in topic, reason=%s", parsed.Reasoning)
+		return nil
+	}
+
+	if len(parsed.UIDs) == 0 && parsed.IncludeSelf {
+		log.Printf("[pipeline] ResolveTopicTarget: self-reference topic, reason=%s", parsed.Reasoning)
 		return []string{defaultUID}
+	}
+
+	if len(parsed.UIDs) == 0 {
+		log.Printf("[pipeline] ResolveTopicTarget: has_target but no UIDs, reason=%s", parsed.Reasoning)
+		return nil
 	}
 
 	var validUIDs []string
@@ -140,8 +165,25 @@ func ResolveTopicTarget(ctx context.Context, topic string, nameMap map[string]st
 	}
 
 	if len(validUIDs) == 0 {
-		log.Printf("[pipeline] ResolveTopicTarget: all UIDs invalid, fallback to creator")
-		return []string{defaultUID}
+		if parsed.IncludeSelf {
+			log.Printf("[pipeline] ResolveTopicTarget: all UIDs invalid but include_self=true, using creator")
+			return []string{defaultUID}
+		}
+		log.Printf("[pipeline] ResolveTopicTarget: all UIDs invalid, fallback to no target")
+		return nil
+	}
+
+	if parsed.IncludeSelf {
+		hasCreator := false
+		for _, uid := range validUIDs {
+			if uid == defaultUID {
+				hasCreator = true
+				break
+			}
+		}
+		if !hasCreator {
+			validUIDs = append(validUIDs, defaultUID)
+		}
 	}
 
 	log.Printf("[pipeline] ResolveTopicTarget: resolved %d target(s) %v, reason=%s",
