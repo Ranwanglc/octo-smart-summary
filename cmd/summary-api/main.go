@@ -32,6 +32,19 @@ func main() {
 		log.Fatalf("[main] connect summary DB: %v", err)
 	}
 
+	// Run database migrations
+	sqlDB, err := summaryDB.DB()
+	if err != nil {
+		log.Fatalf("[main] get raw db: %v", err)
+	}
+	n, err := db.RunMigrations(sqlDB)
+	if err != nil {
+		log.Fatalf("[main] migration failed: %v", err)
+	}
+	if n > 0 {
+		log.Printf("[main] applied %d migration(s)", n)
+	}
+
 	// Init IM DB (for member candidates)
 	imDB, err := db.New(cfg.IMMySQLDSN)
 	if err != nil {

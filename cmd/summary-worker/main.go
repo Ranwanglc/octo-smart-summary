@@ -30,6 +30,19 @@ func main() {
 		log.Fatalf("[worker] connect summary DB: %v", err)
 	}
 
+	// Run database migrations
+	sqlDB, err := summaryDB.DB()
+	if err != nil {
+		log.Fatalf("[worker] get raw db: %v", err)
+	}
+	n, err := db.RunMigrations(sqlDB)
+	if err != nil {
+		log.Fatalf("[worker] migration failed: %v", err)
+	}
+	if n > 0 {
+		log.Printf("[worker] applied %d migration(s)", n)
+	}
+
 	// Init IM DB (read-only, for message fetching)
 	imDB, err := db.New(cfg.IMMySQLDSN)
 	if err != nil {
