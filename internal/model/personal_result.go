@@ -36,6 +36,7 @@ type PersonalResult struct {
 	ModelVersion     string     `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
 	WorkerStatus     int        `gorm:"column:worker_status;type:tinyint;not null;default:0" json:"worker_status"`
 	ErrorMessage     *string    `gorm:"column:error_message;type:varchar(500)" json:"error_message"`
+	EditedAt         *time.Time `gorm:"column:edited_at" json:"edited_at"`
 	SubmittedAt      *time.Time `gorm:"column:submitted_at" json:"submitted_at"`
 	GeneratedAt      *time.Time `gorm:"column:generated_at" json:"generated_at"`
 	CreatedAt        time.Time  `gorm:"column:created_at;not null" json:"created_at"`

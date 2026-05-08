@@ -17,3 +17,12 @@ docker-compose.yml
 # Root-level binaries
 summary-api
 summary-worker
+
+# Review output files (generated, not tracked)
+/cc-*.json
+/codex-*.txt
+/codex-*.log
+/review-*.json
+/review-*.txt
+/*-dev.log
+!docs/**
