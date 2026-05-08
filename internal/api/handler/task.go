@@ -486,8 +486,26 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		"updated_at":       task.UpdatedAt.Format(time.RFC3339),
 	}
 
+	if latestResult.ID > 0 {
+		resp["result_id"] = latestResult.ID
+		if latestResult.EditedAt != nil {
+			resp["result_edited_at"] = latestResult.EditedAt.Format(time.RFC3339)
+			resp["result_is_edited"] = true
+		} else {
+			resp["result_edited_at"] = nil
+			resp["result_is_edited"] = false
+		}
+	} else {
+		resp["result_id"] = nil
+		resp["result_edited_at"] = nil
+		resp["result_is_edited"] = false
+	}
+
 	// Add personal_result and members info
 	userID := middleware.GetUserID(c)
+
+	canEdit := task.CreatorID == userID && task.Status == model.StatusCompleted && len(participants) <= 1
+	resp["permissions"] = gin.H{"can_edit": canEdit}
 
 	var pr model.PersonalResult
 	personalOut := gin.H{
@@ -620,6 +638,7 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 			"error_message":  nil,
 			"submitted_at":   nil,
 			"generated_at":   nil,
+			"edited_at":      nil,
 		}).Error; err != nil {
 			return err
 		}

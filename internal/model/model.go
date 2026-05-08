@@ -191,18 +191,19 @@ type TeamCitation struct {
 
 // SummaryResult represents the final summary output.
 type SummaryResult struct {
-	ID                 int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	TaskID             int64     `gorm:"column:task_id;not null" json:"task_id"`
-	Content            string    `gorm:"column:content;type:mediumtext;not null" json:"content"`
-	CitationsJSON      string    `gorm:"column:citations_json;type:mediumtext" json:"-"`
-	TeamCitationsJSON  string    `gorm:"column:team_citations_json;type:mediumtext" json:"-"`
-	TotalMsgCount      int       `gorm:"column:total_msg_count;not null;default:0" json:"total_msg_count"`
-	TotalTokenUsed     int       `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
-	ModelVersion       string    `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
-	Version            int       `gorm:"column:version;not null;default:1" json:"version"`
-	GeneratedAt        time.Time `gorm:"column:generated_at;not null" json:"generated_at"`
-	CreatedAt          time.Time `gorm:"column:created_at;not null" json:"created_at"`
-	UpdatedAt          time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
+	ID                 int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID             int64      `gorm:"column:task_id;not null" json:"task_id"`
+	Content            string     `gorm:"column:content;type:mediumtext;not null" json:"content"`
+	CitationsJSON      string     `gorm:"column:citations_json;type:mediumtext" json:"-"`
+	TeamCitationsJSON  string     `gorm:"column:team_citations_json;type:mediumtext" json:"-"`
+	TotalMsgCount      int        `gorm:"column:total_msg_count;not null;default:0" json:"total_msg_count"`
+	TotalTokenUsed     int        `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
+	ModelVersion       string     `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
+	Version            int        `gorm:"column:version;not null;default:1" json:"version"`
+	EditedAt           *time.Time `gorm:"column:edited_at" json:"edited_at"`
+	GeneratedAt        time.Time  `gorm:"column:generated_at;not null" json:"generated_at"`
+	CreatedAt          time.Time  `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt          time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
 }
 
 // GetCitations deserializes CitationsJSON into a slice of Citation.

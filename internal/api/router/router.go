@@ -39,6 +39,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	taskH := handler.NewTaskHandler(db, imDB, workerTriggerURL)
 	schedH := handler.NewScheduleHandler(db)
 	personalH := handler.NewPersonalHandler(db, workerTriggerURL, hub)
+	editH := handler.NewEditHandler(db)
 
 	v1 := r.Group("/api/v1")
 	v1.Use(middleware.StrictAuthMiddleware(authResolver), middleware.StrictSpaceMiddleware())
@@ -49,6 +50,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		v1.GET("/summaries/:id", taskH.GetSummary)
 		v1.GET("/summaries/:id/result", taskH.GetResult)
 		v1.POST("/summaries/:id/regenerate", taskH.Regenerate)
+		v1.PUT("/summaries/:id/edit", editH.EditSummary)
 		v1.DELETE("/summaries/:id", taskH.DeleteSummary)
 		v1.POST("/summaries/:id/cancel", taskH.CancelSummary)
 		v1.GET("/summary-infer", taskH.InferScope)
