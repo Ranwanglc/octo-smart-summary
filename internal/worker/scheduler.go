@@ -86,6 +86,37 @@ func scanPendingSchedules(db *gorm.DB) {
 					return err
 				}
 			}
+
+			// Scheduled tasks have no interactive confirmation step: the creator
+			// is the sole participant and is auto-accepted, mirroring the manual
+			// CreateSummary path. Without this, the task has 0 participants and the
+			// processor's single-participant branch dispatches nothing, leaving the
+			// task stuck in Processing with no summary_result.
+			now := time.Now().UTC()
+			creatorP := model.SummaryParticipant{
+				TaskID:      task.ID,
+				UserID:      sched.CreatorID,
+				UserName:    service.ResolveUserName(sched.CreatorID),
+				Status:      model.ParticipantAccepted,
+				ConfirmedAt: &now,
+			}
+			if err := tx.Create(&creatorP).Error; err != nil {
+				return err
+			}
+			creatorPR := model.PersonalResult{
+				TaskID:           task.ID,
+				ParticipantRefID: creatorP.ID,
+				UserID:           sched.CreatorID,
+				WorkerStatus:     model.PersonalStatusPending,
+				CreatedAt:        now,
+				UpdatedAt:        now,
+			}
+			if err := tx.Create(&creatorPR).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&creatorP).Update("personal_result_id", creatorPR.ID).Error; err != nil {
+				return err
+			}
 			return nil
 		})
 		if err != nil {
