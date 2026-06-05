@@ -78,11 +78,15 @@ func doUpdate(t *testing.T, r *gin.Engine, schedID int64, body map[string]interf
 }
 
 func doScheduleJSONRequest(t *testing.T, r *gin.Engine, method, path string, body map[string]interface{}) *httptest.ResponseRecorder {
+	return doScheduleJSONRequestAsUser(t, r, "creator1", "space1", method, path, body)
+}
+
+func doScheduleJSONRequestAsUser(t *testing.T, r *gin.Engine, userID, spaceID, method, path string, body map[string]interface{}) *httptest.ResponseRecorder {
 	t.Helper()
 	b, _ := json.Marshal(body)
 	req := httptest.NewRequest(method, path, bytes.NewReader(b))
-	req.Header.Set("Token", "creator1")
-	req.Header.Set("X-Space-Id", "space1")
+	req.Header.Set("Token", userID)
+	req.Header.Set("X-Space-Id", spaceID)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -167,6 +171,39 @@ func TestUpdateSchedule_SoleOwnerUpdatesInPlace(t *testing.T) {
 	db.Model(&model.SummarySchedule{}).Where("deleted_at IS NULL").Count(&count)
 	if count != 1 {
 		t.Errorf("expected in-place update only, live schedule count = %d", count)
+	}
+}
+
+func TestCreateSchedule_RejectsNonTaskScope(t *testing.T) {
+	db := setupScheduleDB(t)
+	h := NewScheduleHandler(db)
+	r := setupScheduleRouter(h)
+
+	w := doScheduleJSONRequest(t, r, http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"title":           "No bind",
+		"scope":           "list",
+		"interval_days":   1,
+		"run_time":        "09:00",
+		"time_range_type": 2,
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	var resp apiResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, w.Body.String())
+	}
+	if resp.Code != 40000 {
+		t.Fatalf("code=%d want 40000 body=%s", resp.Code, w.Body.String())
+	}
+
+	var count int64
+	if err := db.Model(&model.SummarySchedule{}).Count(&count).Error; err != nil {
+		t.Fatalf("count schedules: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no schedule created, got %d", count)
 	}
 }
 
@@ -535,6 +572,94 @@ func TestUpdateSchedule_TaskScopeRejectsCrossSpaceTask(t *testing.T) {
 	})
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateSchedule_TaskScopeRejectsOtherUsersTask(t *testing.T) {
+	db := setupScheduleDB(t)
+	h := NewScheduleHandler(db)
+	r := setupScheduleRouter(h)
+
+	now := time.Now().UTC()
+	task := model.SummaryTask{
+		TaskNo:         "OTHER-TASK-CREATE",
+		SpaceID:        "space1",
+		CreatorID:      "other-user",
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: now,
+		TimeRangeEnd:   now,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	w := doScheduleJSONRequest(t, r, http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"title":           "bind other task",
+		"scope":           "task",
+		"task_id":         task.ID,
+		"interval_days":   1,
+		"run_time":        "09:30",
+		"time_range_type": 2,
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	var resp apiResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, w.Body.String())
+	}
+	if resp.Code != 40004 {
+		t.Fatalf("code=%d want 40004 body=%s", resp.Code, w.Body.String())
+	}
+}
+
+func TestUpdateSchedule_TaskScopeRejectsOtherUsersTask(t *testing.T) {
+	db := setupScheduleDB(t)
+	h := NewScheduleHandler(db)
+	r := setupScheduleRouter(h)
+
+	sched := model.SummarySchedule{
+		SpaceID:      "space1",
+		CreatorID:    "creator1",
+		Title:        "Owned",
+		SummaryMode:  model.ModeByPerson,
+		IntervalDays: 1,
+		RunTime:      "17:00",
+		IsActive:     1,
+	}
+	if err := db.Create(&sched).Error; err != nil {
+		t.Fatalf("create sched: %v", err)
+	}
+	now := time.Now().UTC()
+	task := model.SummaryTask{
+		TaskNo:         "OTHER-TASK-UPDATE",
+		SpaceID:        "space1",
+		CreatorID:      "other-user",
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: now,
+		TimeRangeEnd:   now,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	w := doScheduleJSONRequest(t, r, http.MethodPut, "/api/v1/summary-schedules/"+itoa(sched.ID), map[string]interface{}{
+		"scope":         "task",
+		"task_id":       task.ID,
+		"run_time":      "09:30",
+		"interval_days": 1,
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	var resp apiResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, w.Body.String())
+	}
+	if resp.Code != 40004 {
+		t.Fatalf("code=%d want 40004 body=%s", resp.Code, w.Body.String())
 	}
 }
 

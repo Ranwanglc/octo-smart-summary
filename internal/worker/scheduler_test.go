@@ -397,14 +397,207 @@ func TestClaimAndCreateScheduledTask_ReusesExistingTaskWithoutNewRows(t *testing
 
 	var resultCount int64
 	db.Model(&model.SummaryResult{}).Where("task_id = ?", task.ID).Count(&resultCount)
-	if resultCount != 0 {
-		t.Fatalf("summaryResultCount=%d want 0", resultCount)
+	if resultCount != 1 {
+		t.Fatalf("summaryResultCount=%d want 1", resultCount)
 	}
 
 	var chunkCount int64
 	db.Model(&model.SummaryChunk{}).Where("task_id = ?", task.ID).Count(&chunkCount)
+	if chunkCount != 1 {
+		t.Fatalf("summaryChunkCount=%d want 1", chunkCount)
+	}
+}
+
+func TestClaimAndCreateScheduledTask_AppliesScheduleConfigs(t *testing.T) {
+	db := setupSchedulerTestDB(t)
+	now := timezone.Now()
+	due := now.Add(-time.Minute)
+
+	sourceConfig := model.JSON(`[{"source_type":3,"source_id":"dm-user-2","source_name":"User Two(私聊)"}]`)
+	participantConfig := model.JSON(`[{"user_id":"user2","user_name":"User Two"}]`)
+	sched := model.SummarySchedule{
+		SpaceID:           "space1",
+		CreatorID:         "creator1",
+		Title:             "Daily",
+		SummaryMode:       model.ModeByPerson,
+		IntervalDays:      1,
+		RunTime:           "09:00",
+		TimeRangeType:     2,
+		SourceConfig:      sourceConfig,
+		ParticipantConfig: participantConfig,
+		IsActive:          1,
+		NextRunAt:         &due,
+	}
+	if err := db.Create(&sched).Error; err != nil {
+		t.Fatalf("create schedule: %v", err)
+	}
+
+	task := model.SummaryTask{
+		TaskNo:         "task-config-sync",
+		SpaceID:        sched.SpaceID,
+		CreatorID:      sched.CreatorID,
+		Title:          "Daily",
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: now.Add(-48 * time.Hour),
+		TimeRangeEnd:   now.Add(-24 * time.Hour),
+		Status:         model.StatusCompleted,
+		TriggerType:    model.TriggerManual,
+		ScheduleID:     &sched.ID,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if err := db.Create(&model.SummarySource{
+		TaskID:     task.ID,
+		SourceType: model.SourceGroup,
+		SourceID:   "group-legacy",
+		SourceName: "Legacy Group",
+	}).Error; err != nil {
+		t.Fatalf("create legacy source: %v", err)
+	}
+	legacyParticipant := model.SummaryParticipant{
+		TaskID:   task.ID,
+		UserID:   "legacy-user",
+		UserName: "Legacy User",
+		Status:   model.ParticipantCompleted,
+	}
+	if err := db.Create(&legacyParticipant).Error; err != nil {
+		t.Fatalf("create legacy participant: %v", err)
+	}
+	if err := db.Create(&model.PersonalResult{
+		TaskID:           task.ID,
+		ParticipantRefID: legacyParticipant.ID,
+		UserID:           legacyParticipant.UserID,
+		WorkerStatus:     model.PersonalStatusCompleted,
+	}).Error; err != nil {
+		t.Fatalf("create legacy personal result: %v", err)
+	}
+
+	taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now)
+	if err != nil {
+		t.Fatalf("claim err: %v", err)
+	}
+	if !claimed || taskID != task.ID {
+		t.Fatalf("claimed=%v taskID=%d want claimed=true taskID=%d", claimed, taskID, task.ID)
+	}
+
+	var sources []model.SummarySource
+	if err := db.Where("task_id = ?", task.ID).Order("id ASC").Find(&sources).Error; err != nil {
+		t.Fatalf("load sources: %v", err)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("source count=%d want 1", len(sources))
+	}
+	if sources[0].SourceID != "dm-user-2" || sources[0].SourceType != 3 {
+		t.Fatalf("unexpected source after sync: %+v", sources[0])
+	}
+
+	var participants []model.SummaryParticipant
+	if err := db.Where("task_id = ?", task.ID).Order("id ASC").Find(&participants).Error; err != nil {
+		t.Fatalf("load participants: %v", err)
+	}
+	if len(participants) != 2 {
+		t.Fatalf("participant count=%d want 2", len(participants))
+	}
+	if participants[0].UserID != "creator1" {
+		t.Fatalf("expected creator first, got %+v", participants[0])
+	}
+	for _, participant := range participants {
+		if participant.Status != model.ParticipantAccepted {
+			t.Fatalf("participant status=%d want %d", participant.Status, model.ParticipantAccepted)
+		}
+		if participant.ConfirmedAt == nil {
+			t.Fatalf("participant %s should be auto-confirmed", participant.UserID)
+		}
+		if participant.PersonalResultID == nil {
+			t.Fatalf("participant %s should have personal_result_id", participant.UserID)
+		}
+	}
+
+	var personalResultCount int64
+	if err := db.Model(&model.PersonalResult{}).Where("task_id = ?", task.ID).Count(&personalResultCount).Error; err != nil {
+		t.Fatalf("count personal results: %v", err)
+	}
+	if personalResultCount != 2 {
+		t.Fatalf("personalResultCount=%d want 2", personalResultCount)
+	}
+}
+
+func TestSaveLatestResultAndCompleteTask_ReplacesOldArtifacts(t *testing.T) {
+	db := setupSchedulerTestDB(t)
+	now := timezone.Now()
+
+	task := model.SummaryTask{
+		TaskNo:         "task-result-swap",
+		SpaceID:        "space1",
+		CreatorID:      "creator1",
+		Title:          "Daily",
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: now.Add(-24 * time.Hour),
+		TimeRangeEnd:   now,
+		Status:         model.StatusProcessing,
+		TriggerType:    model.TriggerScheduled,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	oldResult := model.SummaryResult{
+		TaskID:         task.ID,
+		Content:        "old summary",
+		TotalMsgCount:  5,
+		TotalTokenUsed: 10,
+		ModelVersion:   "old-model",
+		Version:        3,
+		GeneratedAt:    now.Add(-time.Hour),
+	}
+	if err := db.Create(&oldResult).Error; err != nil {
+		t.Fatalf("create old result: %v", err)
+	}
+	if err := db.Create(&model.SummaryChunk{
+		TaskID:       task.ID,
+		ChunkIndex:   1,
+		MsgCount:     2,
+		ChunkSummary: "old chunk",
+	}).Error; err != nil {
+		t.Fatalf("create old chunk: %v", err)
+	}
+
+	newResult := model.SummaryResult{
+		Content:        "new summary",
+		TotalMsgCount:  8,
+		TotalTokenUsed: 16,
+		ModelVersion:   "new-model",
+		GeneratedAt:    now,
+	}
+	if err := saveLatestResultAndCompleteTask(db, task.ID, &newResult); err != nil {
+		t.Fatalf("saveLatestResultAndCompleteTask: %v", err)
+	}
+
+	var results []model.SummaryResult
+	if err := db.Where("task_id = ?", task.ID).Order("version DESC").Find(&results).Error; err != nil {
+		t.Fatalf("load results: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("result count=%d want 1", len(results))
+	}
+	if results[0].Content != "new summary" || results[0].Version != 4 {
+		t.Fatalf("unexpected latest result: %+v", results[0])
+	}
+
+	var chunkCount int64
+	if err := db.Model(&model.SummaryChunk{}).Where("task_id = ?", task.ID).Count(&chunkCount).Error; err != nil {
+		t.Fatalf("count chunks: %v", err)
+	}
 	if chunkCount != 0 {
-		t.Fatalf("summaryChunkCount=%d want 0", chunkCount)
+		t.Fatalf("chunkCount=%d want 0", chunkCount)
+	}
+
+	var reloadedTask model.SummaryTask
+	if err := db.First(&reloadedTask, task.ID).Error; err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if reloadedTask.Status != model.StatusCompleted {
+		t.Fatalf("task status=%d want %d", reloadedTask.Status, model.StatusCompleted)
 	}
 }
 

@@ -153,20 +153,17 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		NextRunAt:         &nextRun,
 	}
 
+	if req.Scope != "task" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "定时必须绑定到指定总结(scope=task)"})
+		return
+	}
+
 	resultScheduleID := int64(0)
 	txErr := h.db.Transaction(func(tx *gorm.DB) error {
-		if req.Scope != "task" {
-			if err := tx.Create(&sched).Error; err != nil {
-				return err
-			}
-			resultScheduleID = sched.ID
-			return nil
-		}
-
 		if req.TaskID == nil {
 			return errTaskScopeMissingTaskID
 		}
-		task, err := loadTaskForTaskScope(tx, spaceID, *req.TaskID)
+		task, err := loadTaskForTaskScope(tx, spaceID, userID, *req.TaskID)
 		if err != nil {
 			return err
 		}
@@ -367,6 +364,10 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 1000 字符"})
 		return
 	}
+	if req.Scope != "" && req.Scope != "task" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "定时必须绑定到指定总结(scope=task)"})
+		return
+	}
 
 	updates := make(map[string]interface{})
 	if req.Title != nil {
@@ -477,7 +478,7 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 				return errTaskScopeMissingTaskID
 			}
 			var err error
-			task, err = loadTaskForTaskScope(tx, spaceID, *req.TaskID)
+			task, err = loadTaskForTaskScope(tx, spaceID, userID, *req.TaskID)
 			if err != nil {
 				return err
 			}
@@ -557,7 +558,7 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 	})
 }
 
-func loadTaskForTaskScope(tx *gorm.DB, spaceID string, taskID int64) (model.SummaryTask, error) {
+func loadTaskForTaskScope(tx *gorm.DB, spaceID, userID string, taskID int64) (model.SummaryTask, error) {
 	var task model.SummaryTask
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).
@@ -566,6 +567,9 @@ func loadTaskForTaskScope(tx *gorm.DB, spaceID string, taskID int64) (model.Summ
 			return model.SummaryTask{}, errTaskScopeInvalidTask
 		}
 		return model.SummaryTask{}, err
+	}
+	if task.CreatorID != userID {
+		return model.SummaryTask{}, service.NewBizError(40004, "仅创建者可绑定定时", http.StatusForbidden)
 	}
 	return task, nil
 }

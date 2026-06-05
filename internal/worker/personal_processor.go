@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -136,31 +137,21 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 
 	if participantCount <= 1 {
 		// Single-person mode: directly create SummaryResult and complete the task
-		nextVer, _ := service.GetNextVersion(p.db, taskID)
 		result := model.SummaryResult{
 			TaskID:         taskID,
 			Content:        content,
 			TotalMsgCount:  msgCount,
 			TotalTokenUsed: totalTokens,
 			ModelVersion:   modelVer,
-			Version:        nextVer,
 			GeneratedAt:    genAt,
 		}
 		result.SetCitations(citations)
-		if err := p.db.Create(&result).Error; err != nil {
+		if err := saveLatestResultAndCompleteTask(p.db, taskID, &result); err != nil {
+			if errors.Is(err, errTaskNoLongerProcessing) {
+				log.Printf("[personal-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
+				return
+			}
 			log.Printf("[personal-worker] save result error task=%d: %v", taskID, err)
-			return
-		}
-
-		casResult := p.db.Model(&model.SummaryTask{}).
-			Where("id = ? AND status = ?", taskID, model.StatusProcessing).
-			Update("status", model.StatusCompleted)
-		if casResult.Error != nil {
-			log.Printf("[personal-worker] task %d update to completed failed: %v", taskID, casResult.Error)
-			return
-		}
-		if casResult.RowsAffected == 0 {
-			log.Printf("[personal-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
 			return
 		}
 

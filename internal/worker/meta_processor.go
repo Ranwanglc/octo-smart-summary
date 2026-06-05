@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"log"
 	"regexp"
 	"sort"
@@ -10,7 +11,6 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 )
@@ -169,8 +169,6 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			teamCitations = extractTeamCitations(finalContent, indexed)
 		}
 
-		// Save result (new version)
-		nextVer, _ := service.GetNextVersion(m.proc.db, taskID)
 		now := timezone.Now()
 
 		// Count total messages across all submitted personal results
@@ -185,7 +183,6 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			TotalMsgCount:  totalMsgCount,
 			TotalTokenUsed: totalTokens,
 			ModelVersion:   m.proc.llm.ModelVersion(),
-			Version:        nextVer,
 			GeneratedAt:    now,
 		}
 		result.SetTeamCitations(teamCitations)
@@ -198,21 +195,12 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			return
 		}
 
-		if err := m.proc.db.Create(&result).Error; err != nil {
+		if err := saveLatestResultAndCompleteTask(m.proc.db, taskID, &result); err != nil {
+			if errors.Is(err, errTaskNoLongerProcessing) {
+				log.Printf("[meta-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
+				return
+			}
 			log.Printf("[meta-worker] save result error task=%d: %v", taskID, err)
-			return
-		}
-
-		// Update task status (CAS: only if still processing)
-		casResult := m.proc.db.Model(&model.SummaryTask{}).
-			Where("id = ? AND status = ?", taskID, model.StatusProcessing).
-			Update("status", model.StatusCompleted)
-		if casResult.Error != nil {
-			log.Printf("[meta-worker] task %d update to completed failed: %v", taskID, casResult.Error)
-			return
-		}
-		if casResult.RowsAffected == 0 {
-			log.Printf("[meta-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
 			return
 		}
 
@@ -226,7 +214,7 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 		})
 
 		log.Printf("[meta-worker] task %d meta-summary version %d created (%d participants)",
-			taskID, nextVer, len(submitted))
+			taskID, result.Version, len(submitted))
 
 		// Check if new submissions arrived during processing
 		if !m.isDirty(taskID) {

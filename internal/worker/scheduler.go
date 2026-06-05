@@ -115,10 +115,7 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 			return nil
 		}
 
-		if err := tx.Where("task_id = ?", task.ID).Delete(&model.SummaryResult{}).Error; err != nil {
-			return err
-		}
-		if err := tx.Where("task_id = ?", task.ID).Delete(&model.SummaryChunk{}).Error; err != nil {
+		if err := syncScheduledTaskConfig(tx, sched, task, now); err != nil {
 			return err
 		}
 
