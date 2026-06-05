@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"sort"
@@ -16,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // TaskHandler handles summary task endpoints.
@@ -96,13 +98,13 @@ func bizErr(c *gin.Context, err *service.BizError) {
 }
 
 type createSummaryReq struct {
-	UID                 string       `json:"uid"`
-	Title               string       `json:"title"`
-	Topic               string       `json:"topic"`
-	TimeRange           *timeRange   `json:"time_range"`
-	Sources             []sourceReq  `json:"sources"`
+	UID                 string           `json:"uid"`
+	Title               string           `json:"title"`
+	Topic               string           `json:"topic"`
+	TimeRange           *timeRange       `json:"time_range"`
+	Sources             []sourceReq      `json:"sources"`
 	Participants        []participantReq `json:"participants"`
-	ConfirmTimeoutHours int          `json:"confirm_timeout_hours"`
+	ConfirmTimeoutHours int              `json:"confirm_timeout_hours"`
 }
 
 type timeRange struct {
@@ -117,7 +119,7 @@ type sourceReq struct {
 
 type participantReq struct {
 	UserName string `json:"user_name"`
-	UserID string `json:"user_id"`
+	UserID   string `json:"user_id"`
 }
 
 // CreateSummary handles POST /api/v1/summaries
@@ -265,9 +267,14 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 				continue
 			}
 			pp := model.SummaryParticipant{
-				TaskID:   task.ID,
-				UserID:   p.UserID,
-				UserName: func() string { if p.UserName != "" { return p.UserName }; return service.ResolveUserName(p.UserID) }(),
+				TaskID: task.ID,
+				UserID: p.UserID,
+				UserName: func() string {
+					if p.UserName != "" {
+						return p.UserName
+					}
+					return service.ResolveUserName(p.UserID)
+				}(),
 			}
 			if err := tx.Create(&pp).Error; err != nil {
 				return err
@@ -492,7 +499,12 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 	// new schedule". Previously this field was missing, so detail.schedule_id was
 	// always empty on the frontend and the update branch never fired.
 	if task.ScheduleID != nil {
-		resp["schedule_id"] = *task.ScheduleID
+		var sched model.SummarySchedule
+		if err := h.db.Where("id = ? AND deleted_at IS NULL AND is_active = 1", *task.ScheduleID).First(&sched).Error; err == nil {
+			resp["schedule_id"] = *task.ScheduleID
+		} else {
+			resp["schedule_id"] = nil
+		}
 	} else {
 		resp["schedule_id"] = nil
 	}
@@ -726,11 +738,32 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 		return
 	}
 
-	// Soft delete: set status = -1 AND deleted_at = NOW()
-	if err := h.db.Model(task).Updates(map[string]interface{}{
-		"status":     -1,
-		"deleted_at": timezone.Now(),
-	}).Error; err != nil {
+	now := timezone.Now()
+	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		var liveTask model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND deleted_at IS NULL", task.ID).
+			First(&liveTask).Error; err != nil {
+			return err
+		}
+
+		if liveTask.ScheduleID != nil {
+			if err := tx.Model(&model.SummarySchedule{}).
+				Where("id = ? AND deleted_at IS NULL", *liveTask.ScheduleID).
+				Update("deleted_at", &now).Error; err != nil {
+				return err
+			}
+		}
+
+		return tx.Model(&liveTask).Updates(map[string]interface{}{
+			"status":     -1,
+			"deleted_at": now,
+		}).Error
+	}); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
 		return
 	}

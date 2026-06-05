@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/robfig/cron/v3"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var schedulerHTTPClient = &http.Client{Timeout: 5 * time.Second}
@@ -30,7 +32,7 @@ func StartScheduler(db *gorm.DB, maxRetry int, workerTriggerURL string) *cron.Cr
 	return c
 }
 
-// scanPendingSchedules creates tasks from due schedules.
+// scanPendingSchedules requeues bound tasks from due schedules.
 func scanPendingSchedules(db *gorm.DB) {
 	now := timezone.Now()
 	var schedules []model.SummarySchedule
@@ -41,114 +43,134 @@ func scanPendingSchedules(db *gorm.DB) {
 	}
 
 	for _, sched := range schedules {
-		// Compute next_run FIRST. If a schedule has dirty/illegal recurrence data
-		// (multiple sources, invalid cron, out-of-bounds interval) NextRunWithInterval
-		// returns an error. Previously we created the task and only then computed
-		// next_run, and on error just `continue`d -- leaving next_run_at in the past
-		// so the same dirty row was re-scanned every 60s, re-creating a summary task
-		// each cycle and burning LLM cost. Now: if next_run can't be computed, we
-		// disable the schedule (is_active=0) and log an alert, then skip task
-		// creation entirely. A human can inspect/fix and re-enable.
-		nextRun, nrErr := service.NextRunWithInterval(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, sched.DayOfWeek, sched.DayOfMonth, now)
-		if nrErr != nil {
-			log.Printf("[scheduler] ALERT schedule %d has invalid recurrence (%v); disabling to stop repeated re-scan/cost", sched.ID, nrErr)
-			db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).
-				Update("is_active", 0)
-			continue
-		}
-
-		// Compute time range
-		start, end := service.ComputeTimeRange(sched.TimeRangeType, now)
-
-		// Parse source config
-		var sources []struct {
-			SourceType int    `json:"source_type"`
-			SourceID   string `json:"source_id"`
-		}
-		if len(sched.SourceConfig) > 0 {
-			json.Unmarshal([]byte(sched.SourceConfig), &sources)
-		}
-
-		taskNo := service.GenerateTaskNo()
-		title := sched.Title
-		if title == "" {
-			title = "定时总结-" + taskNo[len(taskNo)-8:]
-		}
-
-		task := model.SummaryTask{
-			TaskNo:         taskNo,
-			SpaceID:        sched.SpaceID,
-			CreatorID:      sched.CreatorID,
-			Title:          title,
-			SummaryMode:    model.ModeByPerson,
-			TimeRangeStart: start,
-			TimeRangeEnd:   end,
-			Status:         model.StatusPending,
-			TriggerType:    model.TriggerScheduled,
-			ScheduleID:     &sched.ID,
-		}
-
-		err := db.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Create(&task).Error; err != nil {
-				return err
-			}
-			for _, s := range sources {
-				src := model.SummarySource{
-					TaskID:     task.ID,
-					SourceType: s.SourceType,
-					SourceID:   s.SourceID,
-					SourceName: service.ResolveSourceName(s.SourceID),
-				}
-				if err := tx.Create(&src).Error; err != nil {
-					return err
-				}
-			}
-
-			// Scheduled tasks have no interactive confirmation step: the creator
-			// is the sole participant and is auto-accepted, mirroring the manual
-			// CreateSummary path. Without this, the task has 0 participants and the
-			// processor's single-participant branch dispatches nothing, leaving the
-			// task stuck in Processing with no summary_result.
-			now := timezone.Now()
-			creatorP := model.SummaryParticipant{
-				TaskID:      task.ID,
-				UserID:      sched.CreatorID,
-				UserName:    service.ResolveUserName(sched.CreatorID),
-				Status:      model.ParticipantAccepted,
-				ConfirmedAt: &now,
-			}
-			if err := tx.Create(&creatorP).Error; err != nil {
-				return err
-			}
-			creatorPR := model.PersonalResult{
-				TaskID:           task.ID,
-				ParticipantRefID: creatorP.ID,
-				UserID:           sched.CreatorID,
-				WorkerStatus:     model.PersonalStatusPending,
-				CreatedAt:        now,
-				UpdatedAt:        now,
-			}
-			if err := tx.Create(&creatorPR).Error; err != nil {
-				return err
-			}
-			if err := tx.Model(&creatorP).Update("personal_result_id", creatorPR.ID).Error; err != nil {
-				return err
-			}
-			return nil
-		})
+		taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now)
 		if err != nil {
 			log.Printf("[scheduler] create task for schedule %d: %v", sched.ID, err)
 			continue
 		}
+		if !claimed {
+			continue
+		}
+		if taskID == 0 {
+			continue
+		}
+		log.Printf("[scheduler] requeued task %d from schedule %d", taskID, sched.ID)
+	}
+}
 
-		// Update schedule: last_run_at and next_run_at (next_run computed above).
-		db.Model(&sched).Updates(map[string]interface{}{
+func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now time.Time) (int64, bool, error) {
+	if sched.NextRunAt == nil {
+		return 0, false, nil
+	}
+
+	// Compute next_run FIRST. If a schedule has dirty/illegal recurrence data
+	// (multiple sources, invalid cron, out-of-bounds interval) NextRunWithInterval
+	// returns an error. Previously we created the task and only then computed
+	// next_run, and on error just `continue`d -- leaving next_run_at in the past
+	// so the same dirty row was re-scanned every 60s, re-creating a summary task
+	// each cycle and burning LLM cost. Now: if next_run can't be computed, we
+	// disable the schedule (is_active=0) and log an alert, then skip task
+	// creation entirely. A human can inspect/fix and re-enable.
+	nextRun, err := service.NextRunWithInterval(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, sched.DayOfWeek, sched.DayOfMonth, now)
+	if err != nil {
+		log.Printf("[scheduler] ALERT schedule %d has invalid recurrence (%v); disabling to stop repeated re-scan/cost", sched.ID, err)
+		if updErr := db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).Update("is_active", 0).Error; updErr != nil {
+			return 0, false, updErr
+		}
+		return 0, false, nil
+	}
+
+	claim := db.Model(&model.SummarySchedule{}).
+		Where("id = ? AND is_active = 1 AND deleted_at IS NULL AND next_run_at = ?", sched.ID, *sched.NextRunAt).
+		Updates(map[string]interface{}{
 			"last_run_at": now,
 			"next_run_at": nextRun,
 		})
-
-		log.Printf("[scheduler] created task %d from schedule %d", task.ID, sched.ID)
+	if claim.Error != nil {
+		return 0, false, claim.Error
 	}
+	if claim.RowsAffected == 0 {
+		return 0, false, nil
+	}
+
+	// Compute time range
+	start, end := service.ComputeTimeRange(sched.TimeRangeType, now)
+
+	var task model.SummaryTask
+
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("schedule_id = ? AND deleted_at IS NULL", sched.ID).
+			Order("id DESC").
+			First(&task).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				log.Printf("[scheduler] ALERT schedule %d claimed but no bound task found; skipping overwrite", sched.ID)
+				return nil
+			}
+			return err
+		}
+
+		if task.Status == model.StatusProcessing {
+			log.Printf("[scheduler] schedule %d task %d still processing; skipping overlapping overwrite", sched.ID, task.ID)
+			return nil
+		}
+
+		if err := tx.Where("task_id = ?", task.ID).Delete(&model.SummaryResult{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("task_id = ?", task.ID).Delete(&model.SummaryChunk{}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Model(&model.SummaryParticipant{}).
+			Where("task_id = ?", task.ID).
+			Updates(map[string]interface{}{
+				"status":            model.ParticipantAccepted,
+				"confirmed_at":      now,
+				"worker_started_at": nil,
+			}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Model(&model.PersonalResult{}).
+			Where("task_id = ?", task.ID).
+			Updates(map[string]interface{}{
+				"worker_status":    model.PersonalStatusPending,
+				"content":          "",
+				"citations_json":   "",
+				"msg_count":        0,
+				"total_token_used": 0,
+				"model_version":    "",
+				"error_message":    nil,
+				"submitted_at":     nil,
+				"generated_at":     nil,
+				"edited_at":        nil,
+			}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Model(&model.SummaryTask{}).
+			Where("id = ?", task.ID).
+			Updates(map[string]interface{}{
+				"time_range_start":    start,
+				"time_range_end":      end,
+				"status":              model.StatusPending,
+				"trigger_type":        model.TriggerScheduled,
+				"retry_count":         0,
+				"error_message":       nil,
+				"processing_deadline": nil,
+				"confirm_deadline":    nil,
+				"schedule_id":         sched.ID,
+			}).Error; err != nil {
+			return err
+		}
+
+		return nil
+	}); err != nil {
+		return 0, true, err
+	}
+
+	return task.ID, true, nil
 }
 
 // scanConfirmTimeouts auto-declines participants still in WaitingConfirm

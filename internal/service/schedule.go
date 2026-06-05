@@ -309,6 +309,33 @@ func ValidateIntervalForWrite(cronExpr string, intervalDays int, intervalMonths 
 	return nil
 }
 
+// ValidateScheduleAnchors enforces that weekday/month-day selectors match the
+// active recurrence mode instead of being silently ignored.
+func ValidateScheduleAnchors(cronExpr string, intervalDays int, intervalMonths int, dayOfWeek int, dayOfMonth int) error {
+	if cronExpr != "" {
+		if dayOfWeek != 0 || dayOfMonth != 0 {
+			return fmt.Errorf("cron 模式不支持 day_of_week/day_of_month")
+		}
+		return nil
+	}
+	if intervalMonths > 0 {
+		if dayOfWeek != 0 {
+			return fmt.Errorf("月模式不支持 day_of_week")
+		}
+		return nil
+	}
+	if intervalDays > 0 {
+		if dayOfMonth != 0 {
+			return fmt.Errorf("天/周模式不支持 day_of_month")
+		}
+		if intervalDays%7 != 0 && dayOfWeek != 0 {
+			return fmt.Errorf("仅周模式(interval_days 为 7 的倍数)支持 day_of_week")
+		}
+		return nil
+	}
+	return nil
+}
+
 // ValidateInterval enforces bounds and exactly-one-source semantics for a
 // schedule's recurrence definition. It is the single source of truth used by
 // create, update and toggle paths.

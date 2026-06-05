@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"strconv"
@@ -38,6 +39,8 @@ type createScheduleReq struct {
 	TimeRangeType  int              `json:"time_range_type"`
 	Sources        []sourceReq      `json:"sources"`
 	Participants   []participantReq `json:"participants"`
+	Scope          string           `json:"scope,omitempty"`
+	TaskID         *int64           `json:"task_id,omitempty"`
 }
 
 type updateScheduleReq struct {
@@ -51,19 +54,19 @@ type updateScheduleReq struct {
 	TimeRangeType  *int             `json:"time_range_type"`
 	Sources        []sourceReq      `json:"sources,omitempty"`
 	Participants   []participantReq `json:"participants,omitempty"`
-	// Scope distinguishes the call source (Plan A1). When scope == "task", the
-	// caller is the summary detail page editing the period of ONE summary; if the
-	// underlying schedule is shared by multiple tasks we must clone instead of
-	// mutating the shared row. TaskID identifies which task's schedule_id to
-	// rebind to the clone. Empty/other scope (e.g. the schedule list page) keeps
-	// the original "edit the shared template" behaviour.
-	Scope  string `json:"scope,omitempty"`
-	TaskID *int64 `json:"task_id,omitempty"`
+	Scope          string           `json:"scope,omitempty"`
+	TaskID         *int64           `json:"task_id,omitempty"`
 }
 
 type toggleScheduleReq struct {
 	IsActive bool `json:"is_active"`
 }
+
+var (
+	errTaskScopeMissingTaskID = errors.New("scope=task requires task_id")
+	errTaskScopeInvalidTask   = errors.New("scope=task task_id invalid")
+	errTaskScopeScheduleBound = errors.New("scope=task schedule already bound to another task")
+)
 
 // CreateSchedule handles POST /api/v1/summary-schedules
 func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
@@ -101,6 +104,10 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 	}
 	if err := service.ValidateDayOfMonth(req.DayOfMonth); err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40014, Message: err.Error()})
+		return
+	}
+	if err := service.ValidateScheduleAnchors(req.CronExpr, req.IntervalDays, req.IntervalMonths, req.DayOfWeek, req.DayOfMonth); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
 		return
 	}
 	// NextRunInitial: if today's selected run_time is still ahead of now, fire
@@ -145,14 +152,107 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		ParticipantConfig: participantConfig,
 		NextRunAt:         &nextRun,
 	}
-	if err := h.db.Create(&sched).Error; err != nil {
-		log.Printf("[handler] CreateSchedule error: %v", err)
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+
+	resultScheduleID := int64(0)
+	txErr := h.db.Transaction(func(tx *gorm.DB) error {
+		if req.Scope != "task" {
+			if err := tx.Create(&sched).Error; err != nil {
+				return err
+			}
+			resultScheduleID = sched.ID
+			return nil
+		}
+
+		if req.TaskID == nil {
+			return errTaskScopeMissingTaskID
+		}
+		task, err := loadTaskForTaskScope(tx, spaceID, *req.TaskID)
+		if err != nil {
+			return err
+		}
+
+		if task.ScheduleID != nil {
+			var existing model.SummarySchedule
+			err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND space_id = ? AND deleted_at IS NULL", *task.ScheduleID, spaceID).
+				First(&existing).Error
+			switch {
+			case err == nil:
+				var boundCount int64
+				if err := tx.Model(&model.SummaryTask{}).
+					Clauses(clause.Locking{Strength: "UPDATE"}).
+					Where("schedule_id = ? AND deleted_at IS NULL AND id <> ?", existing.ID, task.ID).
+					Count(&boundCount).Error; err != nil {
+					return err
+				}
+				if boundCount > 0 {
+					return errTaskScopeScheduleBound
+				}
+				if existing.CreatorID != userID {
+					return service.NewBizError(40004, "无权限修改", http.StatusForbidden)
+				}
+				updates := map[string]interface{}{
+					"title":              sched.Title,
+					"cron_expr":          sched.CronExpr,
+					"interval_days":      sched.IntervalDays,
+					"interval_months":    sched.IntervalMonths,
+					"run_time":           sched.RunTime,
+					"day_of_week":        sched.DayOfWeek,
+					"day_of_month":       sched.DayOfMonth,
+					"time_range_type":    sched.TimeRangeType,
+					"source_config":      sched.SourceConfig,
+					"participant_config": sched.ParticipantConfig,
+					"next_run_at":        nextRun,
+				}
+				if err := tx.Model(&model.SummarySchedule{}).
+					Where("id = ?", existing.ID).
+					Updates(updates).Error; err != nil {
+					return err
+				}
+				resultScheduleID = existing.ID
+				return nil
+			case errors.Is(err, gorm.ErrRecordNotFound):
+				// The task points to a stale/deleted schedule; create a fresh one
+				// and rebind below.
+			default:
+				return err
+			}
+		}
+
+		if err := tx.Create(&sched).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.SummaryTask{}).
+			Where("id = ? AND space_id = ?", task.ID, spaceID).
+			Update("schedule_id", sched.ID).Error; err != nil {
+			return err
+		}
+		resultScheduleID = sched.ID
+		return nil
+	})
+	if txErr != nil {
+		switch {
+		case errors.Is(txErr, errTaskScopeMissingTaskID):
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "scope=task 时必须传 task_id"})
+			return
+		case errors.Is(txErr, errTaskScopeInvalidTask):
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "task_id 无效或不属于当前空间"})
+			return
+		case errors.Is(txErr, errTaskScopeScheduleBound):
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "该定时已绑定其它总结，不能重复绑定"})
+			return
+		}
+		if biz, ok := txErr.(*service.BizError); ok {
+			bizErr(c, biz)
+			return
+		}
+		log.Printf("[handler] CreateSchedule error: %v", txErr)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: txErr.Error()})
 		return
 	}
 
 	ok(c, gin.H{
-		"schedule_id": sched.ID,
+		"schedule_id": resultScheduleID,
 		"next_run_at": nextRun.Format(time.RFC3339),
 	})
 }
@@ -343,6 +443,10 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
 			return
 		}
+		if err := service.ValidateScheduleAnchors(effCron, effIntervalDays, effIntervalMonths, effDayOfWeek, effDayOfMonth); err != nil {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
+			return
+		}
 		nextRun, err := service.NextRunInitial(effCron, effIntervalDays, effIntervalMonths, effRunTime, effDayOfWeek, effDayOfMonth, timezone.Now())
 		if err != nil {
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
@@ -362,71 +466,80 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		updates["participant_config"] = model.JSON(b)
 	}
 
-	// Plan A1: detail-page single-summary edit must not mutate a schedule that is
-	// shared by multiple tasks. Determine whether to clone, and which schedule id
-	// to report back, inside a single transaction so the "is shared" check and the
-	// clone+rebind cannot interleave with concurrent edits.
 	resultScheduleID := sched.ID
 	var resultNextRunAt *time.Time
 
 	txErr := h.db.Transaction(func(tx *gorm.DB) error {
-		cloned := false
-		if req.Scope == "task" && req.TaskID != nil {
-			// Verify the task belongs to this space and currently points at this
-			// schedule; otherwise fall through to the plain update path.
-			var task model.SummaryTask
-			if err := tx.Where("id = ? AND space_id = ? AND deleted_at IS NULL", *req.TaskID, spaceID).First(&task).Error; err == nil &&
-				task.ScheduleID != nil && *task.ScheduleID == sched.ID {
-				// Count how many live tasks share this schedule. Lock the rows so a
-				// concurrent edit on a sibling task sees a consistent shared count.
-				var shareCount int64
-				if err := tx.Model(&model.SummaryTask{}).
-					Clauses(clause.Locking{Strength: "UPDATE"}).
-					Where("schedule_id = ? AND deleted_at IS NULL", sched.ID).
-					Count(&shareCount).Error; err != nil {
-					return err
-				}
-				if shareCount > 1 {
-					// Shared: clone the schedule with the original fields, then apply
-					// the requested updates onto the clone, and rebind ONLY this task.
-					clone := sched
-					clone.ID = 0
-					clone.CreatedAt = time.Time{}
-					clone.UpdatedAt = time.Time{}
-					clone.DeletedAt = nil
-					clone.LastRunAt = nil
-					// is_active inherited from original (sched.IsActive via struct copy).
-					applyScheduleUpdates(&clone, updates)
-					if err := tx.Create(&clone).Error; err != nil {
-						return err
-					}
-					if err := tx.Model(&model.SummaryTask{}).
-						Where("id = ?", task.ID).
-						Update("schedule_id", clone.ID).Error; err != nil {
-						return err
-					}
-					resultScheduleID = clone.ID
-					resultNextRunAt = clone.NextRunAt
-					cloned = true
-				}
+		var task model.SummaryTask
+		var oldScheduleID *int64
+		if req.Scope == "task" {
+			if req.TaskID == nil {
+				return errTaskScopeMissingTaskID
 			}
-		}
-		if !cloned {
-			// COUNT == 1 (or list-page scope): mutate the existing schedule in place.
-			if err := tx.Model(&model.SummarySchedule{}).
-				Where("id = ?", sched.ID).
-				Updates(updates).Error; err != nil {
+			var err error
+			task, err = loadTaskForTaskScope(tx, spaceID, *req.TaskID)
+			if err != nil {
 				return err
 			}
-			if nr, ok := updates["next_run_at"].(time.Time); ok {
-				resultNextRunAt = &nr
-			} else {
-				resultNextRunAt = sched.NextRunAt
+			if task.ScheduleID != nil && *task.ScheduleID != sched.ID {
+				oldID := *task.ScheduleID
+				oldScheduleID = &oldID
 			}
+			var boundCount int64
+			if err := tx.Model(&model.SummaryTask{}).
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("schedule_id = ? AND deleted_at IS NULL AND id <> ?", sched.ID, task.ID).
+				Count(&boundCount).Error; err != nil {
+				return err
+			}
+			if boundCount > 0 {
+				return errTaskScopeScheduleBound
+			}
+		}
+
+		if req.Scope == "task" && (task.ScheduleID == nil || *task.ScheduleID != sched.ID) {
+			if err := tx.Model(&model.SummaryTask{}).
+				Where("id = ? AND space_id = ?", task.ID, spaceID).
+				Update("schedule_id", sched.ID).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Model(&model.SummarySchedule{}).
+			Where("id = ?", sched.ID).
+			Updates(updates).Error; err != nil {
+			return err
+		}
+		if oldScheduleID != nil {
+			now := timezone.Now()
+			if err := tx.Model(&model.SummarySchedule{}).
+				Where("id = ? AND deleted_at IS NULL", *oldScheduleID).
+				Update("deleted_at", &now).Error; err != nil {
+				return err
+			}
+		}
+		if nr, ok := updates["next_run_at"].(time.Time); ok {
+			resultNextRunAt = &nr
+		} else {
+			resultNextRunAt = sched.NextRunAt
 		}
 		return nil
 	})
 	if txErr != nil {
+		switch {
+		case errors.Is(txErr, errTaskScopeMissingTaskID):
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "scope=task 时必须传 task_id"})
+			return
+		case errors.Is(txErr, errTaskScopeInvalidTask):
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "task_id 无效或不属于当前空间"})
+			return
+		case errors.Is(txErr, errTaskScopeScheduleBound):
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "该定时已绑定其它总结，不能重复绑定"})
+			return
+		}
+		if biz, ok := txErr.(*service.BizError); ok {
+			bizErr(c, biz)
+			return
+		}
 		log.Printf("[handler] UpdateSchedule error: %v", txErr)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: txErr.Error()})
 		return
@@ -444,45 +557,17 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 	})
 }
 
-// applyScheduleUpdates copies the fields present in an UpdateSchedule `updates`
-// map onto a SummarySchedule struct. Used by the Plan A1 clone path so the new
-// schedule carries the original fields plus the requested changes (run_time /
-// interval / day_of_week / day_of_month / next_run_at, etc.) computed by the
-// existing timezone-aware NextRunInitial logic above.
-func applyScheduleUpdates(s *model.SummarySchedule, updates map[string]interface{}) {
-	if v, ok := updates["title"].(string); ok {
-		s.Title = v
+func loadTaskForTaskScope(tx *gorm.DB, spaceID string, taskID int64) (model.SummaryTask, error) {
+	var task model.SummaryTask
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).
+		First(&task).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return model.SummaryTask{}, errTaskScopeInvalidTask
+		}
+		return model.SummaryTask{}, err
 	}
-	if v, ok := updates["cron_expr"].(string); ok {
-		s.CronExpr = v
-	}
-	if v, ok := updates["interval_days"].(int); ok {
-		s.IntervalDays = v
-	}
-	if v, ok := updates["interval_months"].(int); ok {
-		s.IntervalMonths = v
-	}
-	if v, ok := updates["run_time"].(string); ok {
-		s.RunTime = v
-	}
-	if v, ok := updates["day_of_week"].(int); ok {
-		s.DayOfWeek = v
-	}
-	if v, ok := updates["day_of_month"].(int); ok {
-		s.DayOfMonth = v
-	}
-	if v, ok := updates["time_range_type"].(int); ok {
-		s.TimeRangeType = v
-	}
-	if v, ok := updates["source_config"].(model.JSON); ok {
-		s.SourceConfig = v
-	}
-	if v, ok := updates["participant_config"].(model.JSON); ok {
-		s.ParticipantConfig = v
-	}
-	if v, ok := updates["next_run_at"].(time.Time); ok {
-		s.NextRunAt = &v
-	}
+	return task, nil
 }
 
 // DeleteSchedule handles DELETE /api/v1/summary-schedules/:id
@@ -506,7 +591,18 @@ func (h *ScheduleHandler) DeleteSchedule(c *gin.Context) {
 	}
 
 	now := timezone.Now()
-	h.db.Model(&sched).Update("deleted_at", &now)
+	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&sched).Update("deleted_at", &now).Error; err != nil {
+			return err
+		}
+		return tx.Model(&model.SummaryTask{}).
+			Where("schedule_id = ? AND deleted_at IS NULL", sched.ID).
+			Update("schedule_id", nil).Error
+	}); err != nil {
+		log.Printf("[handler] DeleteSchedule error: %v", err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+		return
+	}
 
 	ok(c, nil)
 }
@@ -539,21 +635,28 @@ func (h *ScheduleHandler) ToggleSchedule(c *gin.Context) {
 
 	updates := map[string]interface{}{}
 	if req.IsActive {
-		updates["is_active"] = 1
 		// CRITICAL: recompute next_run_at for ALL recurrence types on re-enable.
 		// Previously only cron was recomputed, so an interval task (cron_expr
 		// empty) kept its stale, already-past next_run_at and fired immediately
 		// on the next scan. Route through the same NextRunWithInterval used by
 		// create/update/scheduler so the next run is always at least one full
 		// interval (or next cron tick) into the future.
-		if nextRun, err := service.NextRunWithInterval(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, sched.DayOfWeek, sched.DayOfMonth, timezone.Now()); err == nil {
-			updates["next_run_at"] = nextRun
+		nextRun, err := service.NextRunWithInterval(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, sched.DayOfWeek, sched.DayOfMonth, timezone.Now())
+		if err != nil {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
+			return
 		}
+		updates["is_active"] = 1
+		updates["next_run_at"] = nextRun
 	} else {
 		updates["is_active"] = 0
 	}
 
-	h.db.Model(&sched).Updates(updates)
+	if err := h.db.Model(&sched).Updates(updates).Error; err != nil {
+		log.Printf("[handler] ToggleSchedule error: %v", err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+		return
+	}
 
 	ok(c, gin.H{
 		"schedule_id": sched.ID,
