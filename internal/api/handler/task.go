@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"sort"
@@ -19,6 +20,9 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+// maxSourceCount is the maximum number of information sources allowed per task.
+const maxSourceCount = 30
 
 // TaskHandler handles summary task endpoints.
 type TaskHandler struct {
@@ -187,8 +191,8 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		sourceList = req.Sources
 	}
 
-	if len(sourceList) > 10 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40003, Message: "信息来源不能超过10个"})
+	if len(sourceList) > maxSourceCount {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40003, Message: fmt.Sprintf("信息来源不能超过%d个", maxSourceCount)})
 		return
 	}
 
