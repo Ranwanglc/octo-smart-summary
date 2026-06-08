@@ -751,6 +751,14 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		// recompute is unambiguous and the task migrates off cron.
 		effCron = ""
 		updates["cron_expr"] = ""
+		if req.DayOfWeek == nil && effIntervalMonths > 0 && effDayOfWeek != 0 {
+			effDayOfWeek = 0
+			updates["day_of_week"] = 0
+		}
+		if req.DayOfMonth == nil && effIntervalDays > 0 && effDayOfMonth != 0 {
+			effDayOfMonth = 0
+			updates["day_of_month"] = 0
+		}
 		if err := service.ValidateIntervalForWrite(effCron, effIntervalDays, effIntervalMonths); err != nil {
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
 			return

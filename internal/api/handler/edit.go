@@ -81,8 +81,8 @@ func (h *EditHandler) EditSummary(c *gin.Context) {
 		return
 	}
 
-	var summaryResult model.SummaryResult
-	if err := h.db.Where("task_id = ?", taskID).Order("version DESC").First(&summaryResult).Error; err != nil {
+	summaryResult, err := queryDisplayResult(h.db, taskID)
+	if err != nil {
 		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "总结结果不存在"})
 		return
 	}
@@ -148,6 +148,18 @@ func (h *EditHandler) EditSummary(c *gin.Context) {
 				"edited_at":      now,
 			}).Error; err != nil {
 			return err
+		}
+
+		if taskCheck.ScheduleID != nil {
+			pauseResult := tx.Model(&model.SummarySchedule{}).
+				Where("id = ? AND deleted_at IS NULL AND is_active = 1", *taskCheck.ScheduleID).
+				Update("is_active", 0)
+			if pauseResult.Error != nil {
+				return pauseResult.Error
+			}
+			if pauseResult.RowsAffected > 0 {
+				log.Printf("[edit] EditSummary: task %d edit auto-paused schedule %d", taskID, *taskCheck.ScheduleID)
+			}
 		}
 
 		return nil

@@ -78,14 +78,7 @@ func (h *TaskHandler) authorizeTaskAccess(c *gin.Context, taskID int64) (*model.
 }
 
 func (h *TaskHandler) pickDisplayResult(taskID int64) (model.SummaryResult, bool) {
-	var result model.SummaryResult
-	err := h.db.
-		Where("task_id = ?", taskID).
-		Order("CASE WHEN edited_at IS NULL THEN 1 ELSE 0 END ASC").
-		Order("edited_at DESC").
-		Order("version DESC").
-		Limit(1).
-		First(&result).Error
+	result, err := queryDisplayResult(h.db, taskID)
 	if err != nil {
 		return model.SummaryResult{}, false
 	}
@@ -898,13 +891,19 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 				}
 			} else {
 				// Not the schedule creator: do not delete someone else's schedule.
-				// Unbind it from this task so the task delete is consistent.
+				// Unbind it from this task and pause it to avoid an active orphan.
 				if err := tx.Model(&model.SummaryTask{}).
 					Where("id = ?", liveTask.ID).
 					Update("schedule_id", nil).Error; err != nil {
 					return err
 				}
+				if err := tx.Model(&model.SummarySchedule{}).
+					Where("id = ? AND deleted_at IS NULL", lockedSched.ID).
+					Update("is_active", 0).Error; err != nil {
+					return err
+				}
 				log.Printf("[task] DeleteSummary: task %d caller %s is not schedule %d creator; unbinding instead of cascade-deleting", liveTask.ID, userID, lockedSched.ID)
+				log.Printf("[task] DeleteSummary: schedule %d auto-paused after non-creator unbind to prevent idle scans", lockedSched.ID)
 			}
 		}
 
