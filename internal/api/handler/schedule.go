@@ -188,6 +188,15 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 				if existing.CreatorID != userID {
 					return service.NewBizError(40004, "无权限修改", http.StatusForbidden)
 				}
+				// Bug1 (PR#62 Jerry-Xin r3): when the detail page rebuilds a
+				// schedule, GetSummary hides the schedule_id for an inactive
+				// binding, so the front-end re-enters via this create path and we
+				// reuse the existing (possibly inactive) schedule. Re-activate it
+				// here (is_active=1) so the scheduler picks it up again; otherwise
+				// the request succeeds and returns next_run_at but the job never
+				// fires. next_run_at uses NextRunInitial (first-run semantics,
+				// same as the fresh-create path) so today's legal first run is not
+				// skipped.
 				updates := map[string]interface{}{
 					"title":              sched.Title,
 					"cron_expr":          sched.CronExpr,
@@ -200,6 +209,7 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 					"source_config":      sched.SourceConfig,
 					"participant_config": sched.ParticipantConfig,
 					"next_run_at":        nextRun,
+					"is_active":          1,
 				}
 				if err := tx.Model(&model.SummarySchedule{}).
 					Where("id = ?", existing.ID).
@@ -512,10 +522,43 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		}
 		if oldScheduleID != nil {
 			now := timezone.Now()
-			if err := tx.Model(&model.SummarySchedule{}).
-				Where("id = ? AND deleted_at IS NULL", *oldScheduleID).
-				Update("deleted_at", &now).Error; err != nil {
-				return err
+			// Bug2 (PR#62 Jerry-Xin r3): rebinding a task moves it off the old
+			// schedule and soft-deletes that schedule. This must respect the
+			// same ownership + exclusivity rule as DeleteSummary's cascade
+			// (task.go DeleteSummary). Without it a caller could soft-delete a
+			// schedule they do not own, or one still bound to another task.
+			// The current task has already been rebound to sched.ID above, so
+			// the old schedule is unbound from this task already; we only soft
+			// delete it when (1) the caller is its creator AND (2) no other
+			// live task still binds it. Otherwise we leave the old schedule
+			// alone (the task is rebound either way).
+			var oldSched model.SummarySchedule
+			if err := tx.Where("id = ? AND deleted_at IS NULL", *oldScheduleID).
+				First(&oldSched).Error; err != nil {
+				if !errors.Is(err, gorm.ErrRecordNotFound) {
+					return err
+				}
+				// old schedule already gone; nothing to soft-delete
+			} else {
+				var otherBound int64
+				if err := tx.Model(&model.SummaryTask{}).
+					Clauses(clause.Locking{Strength: "UPDATE"}).
+					Where("schedule_id = ? AND deleted_at IS NULL", oldSched.ID).
+					Count(&otherBound).Error; err != nil {
+					return err
+				}
+				if oldSched.CreatorID == userID && otherBound == 0 {
+					if err := tx.Model(&model.SummarySchedule{}).
+						Where("id = ? AND deleted_at IS NULL", oldSched.ID).
+						Update("deleted_at", &now).Error; err != nil {
+						return err
+					}
+				} else {
+					// Not the creator, or still bound by another live task: do
+					// not delete someone else's / still-in-use schedule. The
+					// task is already rebound, so just leave the old schedule.
+					log.Printf("[handler] UpdateSchedule: old schedule %d not soft-deleted (caller=%s creator=%s otherBound=%d); unbind-only", oldSched.ID, userID, oldSched.CreatorID, otherBound)
+				}
 			}
 		}
 		if nr, ok := updates["next_run_at"].(time.Time); ok {
