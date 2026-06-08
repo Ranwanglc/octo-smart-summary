@@ -513,3 +513,139 @@ func TestNextRunInitial_TimezoneBeijing(t *testing.T) {
 		t.Errorf("expected +08:00 offset, got %d seconds", off)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Bug2: NextRunScheduledAdvance anchors recompute on the ORIGINAL due time
+// (*sched.NextRunAt), not on `now`, so a late scan does not skip a cycle.
+// ---------------------------------------------------------------------------
+
+// Weekly Monday 09:00 schedule, scanned LATE on Tuesday 10:00. Recompute must
+// land on the NEXT Monday (one week from the missed anchor), NOT skip to the
+// week after next. Anchoring on `now` (the old bug) would have produced
+// 2026-06-15+ behavior; anchoring on the Monday anchor yields 2026-06-15.
+func TestNextRunScheduledAdvance_WeekLateScanNoSkip(t *testing.T) {
+	anchor := shTime(t, "2026-06-08T09:00:00+08:00") // Mon (the missed due time)
+	now := shTime(t, "2026-06-09T10:00:00+08:00")    // Tue, scanned late
+	got, err := NextRunScheduledAdvance("", 7, 0, "09:00", 1, 0, anchor, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-06-15T09:00:00+08:00") // next Mon, not the one after
+	if !got.Equal(want) {
+		t.Fatalf("week late scan: got %v want %v (weekday=%v)", got, want, got.Weekday())
+	}
+	if got.Weekday() != time.Monday {
+		t.Fatalf("expected Monday phase preserved, got %v", got.Weekday())
+	}
+	if !got.After(now) {
+		t.Fatalf("result %v must be strictly after now %v", got, now)
+	}
+}
+
+// On-time weekly scan: anchor==due, now slightly after; one step lands on the
+// following same weekday.
+func TestNextRunScheduledAdvance_WeekOnTime(t *testing.T) {
+	anchor := shTime(t, "2026-06-08T09:00:00+08:00") // Mon
+	now := shTime(t, "2026-06-08T09:00:30+08:00")    // 30s late
+	got, err := NextRunScheduledAdvance("", 7, 0, "09:00", 1, 0, anchor, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-06-15T09:00:00+08:00")
+	if !got.Equal(want) {
+		t.Fatalf("week on time: got %v want %v", got, want)
+	}
+}
+
+// 14/21/28-day intervals must keep their multi-week cadence and weekday phase
+// when scanned late by more than one of the sub-weeks but less than a full
+// interval.
+func TestNextRunScheduledAdvance_MultiWeekIntervals(t *testing.T) {
+	cases := []struct {
+		name     string
+		interval int
+		anchor   string
+		now      string
+		want     string
+	}{
+		{"14d late 3 days", 14, "2026-06-08T09:00:00+08:00", "2026-06-11T10:00:00+08:00", "2026-06-22T09:00:00+08:00"},
+		{"21d late 5 days", 21, "2026-06-08T09:00:00+08:00", "2026-06-13T10:00:00+08:00", "2026-06-29T09:00:00+08:00"},
+		{"28d late 10 days", 28, "2026-06-08T09:00:00+08:00", "2026-06-18T10:00:00+08:00", "2026-07-06T09:00:00+08:00"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			anchor := shTime(t, tc.anchor)
+			now := shTime(t, tc.now)
+			got, err := NextRunScheduledAdvance("", tc.interval, 0, "09:00", 1, 0, anchor, now)
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			want := shTime(t, tc.want)
+			if !got.Equal(want) {
+				t.Fatalf("%s: got %v want %v", tc.name, got, want)
+			}
+			if got.Weekday() != time.Monday {
+				t.Fatalf("%s: weekday phase drifted to %v", tc.name, got.Weekday())
+			}
+		})
+	}
+}
+
+// Cross-MULTIPLE-period downtime: scheduler was down ~3 weeks for a weekly
+// schedule; result is the nearest FUTURE Monday, phase preserved.
+func TestNextRunScheduledAdvance_MultiPeriodDowntime(t *testing.T) {
+	anchor := shTime(t, "2026-06-08T09:00:00+08:00") // Mon
+	now := shTime(t, "2026-06-25T10:00:00+08:00")    // ~2.5 weeks later
+	got, err := NextRunScheduledAdvance("", 7, 0, "09:00", 1, 0, anchor, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-06-29T09:00:00+08:00") // next Monday strictly after now
+	if !got.Equal(want) {
+		t.Fatalf("multi-period downtime: got %v want %v", got, want)
+	}
+}
+
+// Day mode (not a multiple of 7) keeps fixed N*24h cadence from the anchor.
+func TestNextRunScheduledAdvance_DayMode(t *testing.T) {
+	anchor := shTime(t, "2026-06-08T09:00:00+08:00")
+	now := shTime(t, "2026-06-09T10:00:00+08:00") // late by ~1 day
+	got, err := NextRunScheduledAdvance("", 1, 0, "09:00", 0, 0, anchor, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	// +1d from anchor = 06-09 09:00 (<= now), +1d again = 06-10 09:00 (> now).
+	want := shTime(t, "2026-06-10T09:00:00+08:00")
+	if !got.Equal(want) {
+		t.Fatalf("day mode: got %v want %v", got, want)
+	}
+}
+
+// Month mode keeps day-of-month phase and month-end clamp under late scan.
+func TestNextRunScheduledAdvance_MonthClampLate(t *testing.T) {
+	anchor := shTime(t, "2026-01-31T09:00:00+08:00") // monthly on the 31st
+	now := shTime(t, "2026-02-05T10:00:00+08:00")    // scanned in Feb
+	got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 31, anchor, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	// +1 month from Jan 31 clamps to Feb 28 (2026 not leap); strictly after now.
+	want := shTime(t, "2026-02-28T09:00:00+08:00")
+	if !got.Equal(want) {
+		t.Fatalf("month clamp late: got %v want %v", got, want)
+	}
+}
+
+// Cron mode is unchanged: it returns the next occurrence strictly after now.
+func TestNextRunScheduledAdvance_CronUsesNow(t *testing.T) {
+	anchor := shTime(t, "2026-06-01T09:00:00+08:00")
+	now := shTime(t, "2026-06-09T10:00:00+08:00")
+	got, err := NextRunScheduledAdvance("0 9 * * *", 0, 0, "", 0, 0, anchor, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-06-10T09:00:00+08:00")
+	if !got.Equal(want) {
+		t.Fatalf("cron: got %v want %v", got, want)
+	}
+}

@@ -73,6 +73,54 @@ func NextRunWithInterval(cronExpr string, intervalDays int, intervalMonths int, 
 	return NextRun(cronExpr, from)
 }
 
+// NextRunScheduledAdvance computes the next_run for the scheduler's post-run
+// recompute. Unlike NextRunWithInterval (which steps a single interval from
+// `from`), this advances from the schedule's ORIGINAL due time (`anchor`,
+// i.e. *sched.NextRunAt) by whole periods until the result is strictly after
+// `now`, preserving the weekday / day-of-month phase.
+//
+// Why anchor, not now: if the scheduler fires late (e.g. a weekly Monday 09:00
+// schedule is only scanned Tuesday 10:00) computing from `now` would jump to
+// the week AFTER next and silently skip the just-missed Monday. Anchoring on
+// the original due time keeps the cadence: from Monday 09:00 we step +1 week to
+// next Monday 09:00, which is the correct nearest future occurrence.
+//
+// For interval modes a single full step is normally enough to pass `now`; the
+// loop only iterates more when the scheduler was down for multiple periods. We
+// cap iterations defensively so a pathological anchor far in the past cannot
+// spin forever. Cron mode is unchanged (cron.Next already returns the next
+// occurrence strictly after its argument, so we feed it `now`).
+func NextRunScheduledAdvance(cronExpr string, intervalDays int, intervalMonths int, runTime string, dayOfWeek int, dayOfMonth int, anchor time.Time, now time.Time) (time.Time, error) {
+	if err := ValidateInterval(cronExpr, intervalDays, intervalMonths); err != nil {
+		return time.Time{}, err
+	}
+	// Cron mode: cron.Next is inherently "strictly after" semantics; anchoring
+	// is irrelevant because the cron expression fully defines the cadence.
+	if intervalMonths == 0 && intervalDays == 0 {
+		return NextRun(cronExpr, now)
+	}
+
+	// Defensive cap: at most ~ (10 years / shortest period) steps. Each loop
+	// advances at least one day, so 4000 iterations covers >10y of downtime.
+	const maxSteps = 4000
+	next := anchor
+	for i := 0; i < maxSteps; i++ {
+		stepped, err := NextRunWithInterval(cronExpr, intervalDays, intervalMonths, runTime, dayOfWeek, dayOfMonth, next)
+		if err != nil {
+			return time.Time{}, err
+		}
+		// Guard against a non-advancing step (would otherwise infinite-loop).
+		if !stepped.After(next) {
+			return time.Time{}, fmt.Errorf("next_run did not advance from %s (interval_days=%d interval_months=%d)", next, intervalDays, intervalMonths)
+		}
+		next = stepped
+		if next.After(now) {
+			return next, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("next_run exceeded %d advance steps from anchor %s (now=%s)", maxSteps, anchor, now)
+}
+
 // NextRunInitial computes the FIRST next_run at create/update time. Unlike the
 // ADVANCE form, if the user-selected time-of-day for the next valid day is still
 // ahead of `from` (now), it fires that day rather than waiting a full interval.

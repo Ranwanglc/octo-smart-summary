@@ -64,14 +64,20 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 	}
 
 	// Compute next_run FIRST. If a schedule has dirty/illegal recurrence data
-	// (multiple sources, invalid cron, out-of-bounds interval) NextRunWithInterval
+	// (multiple sources, invalid cron, out-of-bounds interval) the recompute
 	// returns an error. Previously we created the task and only then computed
 	// next_run, and on error just `continue`d -- leaving next_run_at in the past
 	// so the same dirty row was re-scanned every 60s, re-creating a summary task
 	// each cycle and burning LLM cost. Now: if next_run can't be computed, we
 	// disable the schedule (is_active=0) and log an alert, then skip task
 	// creation entirely. A human can inspect/fix and re-enable.
-	nextRun, err := service.NextRunWithInterval(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, sched.DayOfWeek, sched.DayOfMonth, now)
+	//
+	// Bug2 fix: advance from the ORIGINAL due time (*sched.NextRunAt), not from
+	// `now`. A late scan (e.g. weekly Monday 09:00 scanned Tuesday 10:00) used to
+	// recompute from now and jump to the week AFTER next, silently skipping the
+	// just-missed Monday. NextRunScheduledAdvance steps whole periods from the
+	// anchor until strictly > now, keeping the weekday/day-of-month phase.
+	nextRun, err := service.NextRunScheduledAdvance(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, sched.DayOfWeek, sched.DayOfMonth, *sched.NextRunAt, now)
 	if err != nil {
 		log.Printf("[scheduler] ALERT schedule %d has invalid recurrence (%v); disabling to stop repeated re-scan/cost", sched.ID, err)
 		if updErr := db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).Update("is_active", 0).Error; updErr != nil {
@@ -80,32 +86,47 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 		return 0, false, nil
 	}
 
-	claim := db.Model(&model.SummarySchedule{}).
-		Where("id = ? AND is_active = 1 AND deleted_at IS NULL AND next_run_at = ?", sched.ID, *sched.NextRunAt).
-		Updates(map[string]interface{}{
-			"last_run_at": now,
-			"next_run_at": nextRun,
-		})
-	if claim.Error != nil {
-		return 0, false, claim.Error
-	}
-	if claim.RowsAffected == 0 {
-		return 0, false, nil
-	}
-
 	// Compute time range
 	start, end := service.ComputeTimeRange(sched.TimeRangeType, now)
 
 	var task model.SummaryTask
+	claimed := false
 	requeued := false
 
+	// Bug1 fix: the schedule-claim CAS (advancing last_run_at/next_run_at) and
+	// the task reset now live in the SAME transaction. Previously the CAS ran in
+	// its own statement and the reset in a SEPARATE db.Transaction; if the reset
+	// failed, next_run_at had already advanced so the row was no longer due and
+	// the task was never rescheduled -- a silently dropped cycle. By merging
+	// them, any technical failure rolls back BOTH (next_run_at stays put, the
+	// 60s scan retries next cycle). Business skips (no bound task, overlapping
+	// Processing, multi-person guard) still COMMIT the advanced next_run_at so we
+	// don't re-scan the same row forever; only real errors trigger rollback.
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		claim := tx.Model(&model.SummarySchedule{}).
+			Where("id = ? AND is_active = 1 AND deleted_at IS NULL AND next_run_at = ?", sched.ID, *sched.NextRunAt).
+			Updates(map[string]interface{}{
+				"last_run_at": now,
+				"next_run_at": nextRun,
+			})
+		if claim.Error != nil {
+			return claim.Error
+		}
+		if claim.RowsAffected == 0 {
+			// Lost the optimistic-lock race (another scanner already claimed this
+			// cycle, or the row was deactivated/retimed). Not an error: commit the
+			// empty transaction and report "not claimed".
+			return nil
+		}
+		claimed = true
+
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("schedule_id = ? AND deleted_at IS NULL", sched.ID).
 			Order("id DESC").
 			First(&task).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				log.Printf("[scheduler] ALERT schedule %d claimed but no bound task found; skipping overwrite", sched.ID)
+				// Business skip: keep the advanced next_run_at (commit), no reset.
 				return nil
 			}
 			return err
@@ -113,6 +134,7 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 
 		if task.Status == model.StatusProcessing {
 			log.Printf("[scheduler] schedule %d task %d still processing; skipping overlapping overwrite", sched.ID, task.ID)
+			// Business skip (overlap protection): commit advanced next_run_at.
 			return nil
 		}
 
@@ -135,6 +157,7 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 		}
 		if participantCount > 1 {
 			log.Printf("[scheduler] schedule %d bound task %d is multi-person (%d participants); scheduled summary not supported for team tasks this version, skipping (next_run_at already advanced; expected re-skip next cycle)", sched.ID, task.ID, participantCount)
+			// Business skip (multi-person guard): commit advanced next_run_at.
 			return nil
 		}
 
@@ -188,7 +211,13 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 
 		return nil
 	}); err != nil {
-		return 0, true, err
+		// Technical failure: whole tx (including the next_run_at advance) rolled
+		// back. next_run_at stays in the past so the next 60s scan retries.
+		return 0, false, err
+	}
+
+	if !claimed {
+		return 0, false, nil
 	}
 
 	// Only report a real requeue when we actually reset the task. Skipped cases

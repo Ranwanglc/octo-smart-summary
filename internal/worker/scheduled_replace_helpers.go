@@ -139,7 +139,23 @@ func syncScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw mode
 	return nil
 }
 
-func saveLatestResultAndCompleteTask(db *gorm.DB, taskID int64, result *model.SummaryResult) error {
+// saveLatestResultAndCompleteTask inserts the new result and marks the task
+// Completed (insert-then-delete-old + task-level CAS; version is monotonic via
+// GetNextVersion). The isScheduled flag controls VERSION RETENTION scope:
+//
+//   - isScheduled == true  (TriggerScheduled): keep only the just-inserted
+//     latest result + drop its chunks. Scheduled runs reuse one bound task and
+//     periodically overwrite it in place, so stale prior-cycle results must be
+//     pruned to a single current version.
+//   - isScheduled == false (manual / normal / team meta): KEEP all prior
+//     versions; only insert the new version and complete the task. Those paths
+//     intentionally accumulate a version history that the UI exposes, so the
+//     helper must NOT delete older results for them (Bug3: the prune used to run
+//     unconditionally and silently collapsed manual/team history to one row).
+//
+// The internal insert/CAS/version-monotonicity logic is unchanged; only the
+// old-version cleanup is now gated on isScheduled.
+func saveLatestResultAndCompleteTask(db *gorm.DB, taskID int64, result *model.SummaryResult, isScheduled bool) error {
 	return db.Transaction(func(tx *gorm.DB) error {
 		nextVer, err := service.GetNextVersion(tx, taskID)
 		if err != nil {
@@ -150,13 +166,17 @@ func saveLatestResultAndCompleteTask(db *gorm.DB, taskID int64, result *model.Su
 		if err := tx.Create(result).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("task_id = ? AND id <> ?", taskID, result.ID).Delete(&model.SummaryResult{}).Error; err != nil {
-			return err
-		}
-		// summary_chunk currently has no version column, so cleanup must happen
-		// only after the replacement result is durably inserted.
-		if err := tx.Where("task_id = ?", taskID).Delete(&model.SummaryChunk{}).Error; err != nil {
-			return err
+		if isScheduled {
+			// Scheduled-only: prune stale prior-cycle versions, keeping only the
+			// freshly inserted result. Manual/team keep full version history.
+			if err := tx.Where("task_id = ? AND id <> ?", taskID, result.ID).Delete(&model.SummaryResult{}).Error; err != nil {
+				return err
+			}
+			// summary_chunk currently has no version column, so cleanup must happen
+			// only after the replacement result is durably inserted.
+			if err := tx.Where("task_id = ?", taskID).Delete(&model.SummaryChunk{}).Error; err != nil {
+				return err
+			}
 		}
 
 		casResult := tx.Model(&model.SummaryTask{}).

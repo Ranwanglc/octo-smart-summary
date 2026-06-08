@@ -146,7 +146,9 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 			GeneratedAt:    genAt,
 		}
 		result.SetCitations(citations)
-		if err := saveLatestResultAndCompleteTask(p.db, taskID, &result); err != nil {
+		// Bug3: only scheduled tasks prune old versions in place; manual/normal
+		// single-person runs keep their full version history.
+		if err := saveLatestResultAndCompleteTask(p.db, taskID, &result, task.TriggerType == model.TriggerScheduled); err != nil {
 			if errors.Is(err, errTaskNoLongerProcessing) {
 				log.Printf("[personal-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
 				return

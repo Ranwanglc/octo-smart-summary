@@ -569,7 +569,7 @@ func TestSaveLatestResultAndCompleteTask_ReplacesOldArtifacts(t *testing.T) {
 		ModelVersion:   "new-model",
 		GeneratedAt:    now,
 	}
-	if err := saveLatestResultAndCompleteTask(db, task.ID, &newResult); err != nil {
+	if err := saveLatestResultAndCompleteTask(db, task.ID, &newResult, true); err != nil {
 		t.Fatalf("saveLatestResultAndCompleteTask: %v", err)
 	}
 
@@ -782,5 +782,269 @@ func TestClaimAndCreateScheduledTask_MultiPersonTaskSkipped(t *testing.T) {
 	}
 	if updated.NextRunAt == nil || !updated.NextRunAt.After(due) {
 		t.Fatalf("expected next_run_at advanced, got %v", updated.NextRunAt)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bug1: schedule-claim CAS and task reset are now in ONE transaction. A
+// technical failure during the reset must ROLL BACK the next_run_at advance so
+// the schedule stays due and is retried next cycle (no silently dropped cycle).
+// ---------------------------------------------------------------------------
+func TestClaimAndCreateScheduledTask_TechnicalFailureRollsBackNextRun(t *testing.T) {
+	db := setupSchedulerTestDB(t)
+	now := timezone.Now()
+	due := now.Add(-time.Minute)
+
+	sched := model.SummarySchedule{
+		SpaceID:       "space1",
+		CreatorID:     "creator1",
+		Title:         "Daily",
+		SummaryMode:   model.ModeByPerson,
+		IntervalDays:  1,
+		RunTime:       "09:00",
+		TimeRangeType: 2,
+		IsActive:      1,
+		NextRunAt:     &due,
+	}
+	if err := db.Create(&sched).Error; err != nil {
+		t.Fatalf("create schedule: %v", err)
+	}
+	task := model.SummaryTask{
+		TaskNo:         "task-rollback-1",
+		SpaceID:        sched.SpaceID,
+		CreatorID:      sched.CreatorID,
+		Title:          "Daily",
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: now.Add(-48 * time.Hour),
+		TimeRangeEnd:   now.Add(-24 * time.Hour),
+		Status:         model.StatusCompleted,
+		TriggerType:    model.TriggerManual,
+		ScheduleID:     &sched.ID,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	participant := model.SummaryParticipant{
+		TaskID:      task.ID,
+		UserID:      sched.CreatorID,
+		UserName:    "Creator",
+		Status:      model.ParticipantCompleted,
+		ConfirmedAt: &now,
+	}
+	if err := db.Create(&participant).Error; err != nil {
+		t.Fatalf("create participant: %v", err)
+	}
+
+	// Induce a technical failure INSIDE the reset path: drop personal_results so
+	// syncScheduledTaskConfig's delete/insert errors. The claim CAS already ran
+	// in the same tx; with the Bug1 fix it must roll back together.
+	if err := db.Migrator().DropTable(&model.PersonalResult{}); err != nil {
+		t.Fatalf("drop personal_results: %v", err)
+	}
+
+	taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now)
+	if err == nil {
+		t.Fatalf("expected technical error, got nil (taskID=%d claimed=%v)", taskID, claimed)
+	}
+	if claimed {
+		t.Fatalf("claimed should be false on rollback, got true")
+	}
+
+	// next_run_at MUST be unchanged (still the original due time) -> still due.
+	var reloaded model.SummarySchedule
+	if err := db.First(&reloaded, sched.ID).Error; err != nil {
+		t.Fatalf("reload schedule: %v", err)
+	}
+	if reloaded.NextRunAt == nil || !reloaded.NextRunAt.Equal(due) {
+		t.Fatalf("next_run_at advanced despite rollback: got %v want %v", reloaded.NextRunAt, due)
+	}
+	if reloaded.LastRunAt != nil {
+		t.Fatalf("last_run_at advanced despite rollback: %v", reloaded.LastRunAt)
+	}
+}
+
+// Bug1: a BUSINESS skip (overlapping Processing task) must COMMIT the advanced
+// next_run_at (not roll back), so we don't re-scan the same row forever.
+func TestClaimAndCreateScheduledTask_BusinessSkipCommitsNextRun(t *testing.T) {
+	db := setupSchedulerTestDB(t)
+	now := timezone.Now()
+	due := now.Add(-time.Minute)
+
+	sched := model.SummarySchedule{
+		SpaceID:       "space1",
+		CreatorID:     "creator1",
+		Title:         "Daily",
+		SummaryMode:   model.ModeByPerson,
+		IntervalDays:  1,
+		RunTime:       "09:00",
+		TimeRangeType: 2,
+		IsActive:      1,
+		NextRunAt:     &due,
+	}
+	if err := db.Create(&sched).Error; err != nil {
+		t.Fatalf("create schedule: %v", err)
+	}
+	// Bound task is STILL processing -> overlap protection skip.
+	task := model.SummaryTask{
+		TaskNo:         "task-overlap-1",
+		SpaceID:        sched.SpaceID,
+		CreatorID:      sched.CreatorID,
+		Title:          "Daily",
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: now.Add(-48 * time.Hour),
+		TimeRangeEnd:   now.Add(-24 * time.Hour),
+		Status:         model.StatusProcessing,
+		TriggerType:    model.TriggerScheduled,
+		ScheduleID:     &sched.ID,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now)
+	if err != nil {
+		t.Fatalf("unexpected error on business skip: %v", err)
+	}
+	if !claimed {
+		t.Fatalf("expected claimed=true for business skip")
+	}
+	if taskID != 0 {
+		t.Fatalf("expected taskID=0 for skip, got %d", taskID)
+	}
+
+	// next_run_at MUST have advanced (committed) so the row isn't re-scanned.
+	var reloaded model.SummarySchedule
+	if err := db.First(&reloaded, sched.ID).Error; err != nil {
+		t.Fatalf("reload schedule: %v", err)
+	}
+	if reloaded.NextRunAt == nil || !reloaded.NextRunAt.After(due) {
+		t.Fatalf("next_run_at should advance on business skip: got %v due %v", reloaded.NextRunAt, due)
+	}
+
+	// The processing task must NOT have been reset/overwritten.
+	var reloadedTask model.SummaryTask
+	if err := db.First(&reloadedTask, task.ID).Error; err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if reloadedTask.Status != model.StatusProcessing {
+		t.Fatalf("overlapping task got overwritten: status=%d", reloadedTask.Status)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bug3: saveLatestResultAndCompleteTask version-retention scope.
+//   isScheduled=false (manual/team) -> KEEP all prior versions.
+//   isScheduled=true  (scheduled)   -> prune to the latest version only.
+// ---------------------------------------------------------------------------
+func TestSaveLatestResultAndCompleteTask_NonScheduledKeepsVersions(t *testing.T) {
+	db := setupSchedulerTestDB(t)
+	now := timezone.Now()
+
+	task := model.SummaryTask{
+		TaskNo:         "task-keep-versions",
+		SpaceID:        "space1",
+		CreatorID:      "creator1",
+		Title:          "Manual",
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: now.Add(-24 * time.Hour),
+		TimeRangeEnd:   now,
+		Status:         model.StatusProcessing,
+		TriggerType:    model.TriggerManual,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	oldResult := model.SummaryResult{
+		TaskID:       task.ID,
+		Content:      "v1 manual",
+		ModelVersion: "m1",
+		Version:      1,
+		GeneratedAt:  now.Add(-time.Hour),
+	}
+	if err := db.Create(&oldResult).Error; err != nil {
+		t.Fatalf("create old result: %v", err)
+	}
+
+	newResult := model.SummaryResult{
+		Content:      "v2 manual",
+		ModelVersion: "m2",
+		GeneratedAt:  now,
+	}
+	// isScheduled=false -> must KEEP the old version.
+	if err := saveLatestResultAndCompleteTask(db, task.ID, &newResult, false); err != nil {
+		t.Fatalf("saveLatestResultAndCompleteTask: %v", err)
+	}
+
+	var results []model.SummaryResult
+	if err := db.Where("task_id = ?", task.ID).Order("version ASC").Find(&results).Error; err != nil {
+		t.Fatalf("load results: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("non-scheduled result count=%d want 2 (history kept)", len(results))
+	}
+	// Version monotonicity: new version is strictly greater than the old.
+	if results[1].Version <= results[0].Version {
+		t.Fatalf("version not monotonic: %d then %d", results[0].Version, results[1].Version)
+	}
+	if results[1].Content != "v2 manual" {
+		t.Fatalf("latest content=%q want v2 manual", results[1].Content)
+	}
+
+	var reloadedTask model.SummaryTask
+	if err := db.First(&reloadedTask, task.ID).Error; err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if reloadedTask.Status != model.StatusCompleted {
+		t.Fatalf("task status=%d want completed", reloadedTask.Status)
+	}
+}
+
+// Scheduled path still prunes to a single latest version (regression guard for
+// the in-place overwrite semantics the scheduler relies on).
+func TestSaveLatestResultAndCompleteTask_ScheduledPrunesOldVersions(t *testing.T) {
+	db := setupSchedulerTestDB(t)
+	now := timezone.Now()
+
+	task := model.SummaryTask{
+		TaskNo:         "task-prune-versions",
+		SpaceID:        "space1",
+		CreatorID:      "creator1",
+		Title:          "Scheduled",
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: now.Add(-24 * time.Hour),
+		TimeRangeEnd:   now,
+		Status:         model.StatusProcessing,
+		TriggerType:    model.TriggerScheduled,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if err := db.Create(&model.SummaryResult{
+		TaskID: task.ID, Content: "old cycle", Version: 1, GeneratedAt: now.Add(-time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("create old result: %v", err)
+	}
+	if err := db.Create(&model.SummaryChunk{
+		TaskID: task.ID, ChunkIndex: 1, MsgCount: 2, ChunkSummary: "old chunk",
+	}).Error; err != nil {
+		t.Fatalf("create old chunk: %v", err)
+	}
+
+	newResult := model.SummaryResult{Content: "new cycle", GeneratedAt: now}
+	if err := saveLatestResultAndCompleteTask(db, task.ID, &newResult, true); err != nil {
+		t.Fatalf("saveLatestResultAndCompleteTask: %v", err)
+	}
+
+	var results []model.SummaryResult
+	if err := db.Where("task_id = ?", task.ID).Find(&results).Error; err != nil {
+		t.Fatalf("load results: %v", err)
+	}
+	if len(results) != 1 || results[0].Content != "new cycle" {
+		t.Fatalf("scheduled prune: got %d results %+v want 1 'new cycle'", len(results), results)
+	}
+	var chunkCount int64
+	db.Model(&model.SummaryChunk{}).Where("task_id = ?", task.ID).Count(&chunkCount)
+	if chunkCount != 0 {
+		t.Fatalf("scheduled chunk cleanup: count=%d want 0", chunkCount)
 	}
 }

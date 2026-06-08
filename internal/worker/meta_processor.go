@@ -195,7 +195,11 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			return
 		}
 
-		if err := saveLatestResultAndCompleteTask(m.proc.db, taskID, &result); err != nil {
+		// Bug3: the meta (team) flow is the human-driven multi-person link, which
+		// intentionally retains a full version history (re-submissions create new
+		// versions). Scheduled summary is single-person-only this version and never
+		// reaches the meta path, so pruning is always disabled here.
+		if err := saveLatestResultAndCompleteTask(m.proc.db, taskID, &result, false); err != nil {
 			if errors.Is(err, errTaskNoLongerProcessing) {
 				log.Printf("[meta-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
 				return
