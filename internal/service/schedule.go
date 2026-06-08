@@ -25,36 +25,14 @@ func NextRun(cronExpr string, from time.Time) (time.Time, error) {
 	return schedule.Next(from), nil
 }
 
-// NextRunWithInterval computes the next run time. Scheduling sources are
-// mutually exclusive and evaluated with a single, global priority order so
-// that create/update/toggle all behave identically:
-//
-//  1. intervalMonths > 0  -> natural-month stepping via addMonthsClamped,
-//     which keeps the same day-of-month when it exists and otherwise clamps to
-//     the last day of the target month (e.g. Jan 31 + 1 month -> Feb 28/29
-//     instead of Go's default Mar 3 overflow), respecting variable month
-//     lengths (no fixed-day approximation).
-//  2. intervalDays   > 0  -> fixed N*24h interval (day = N*1, week = N*7).
-//  3. otherwise           -> standard cron expression.
-//
-// For the two interval modes runTime ("HH:MM", Asia/Shanghai 北京时间) anchors
-// the time-of-day so the run hour stays stable regardless of when the scheduler
-// actually fired. An empty runTime keeps the time-of-day of `from`. runTime is
-// ignored for cron (the cron expression already encodes the time). `from` is
-// expected to be in Asia/Shanghai (callers pass timezone.Now()), so all derived
-// times stay in 北京时间.
-//
-// dayOfWeek (1=Mon..7=Sun, 0=unset) aligns the WEEK mode (intervalDays multiple
-// of 7) to a specific weekday; dayOfMonth (1..31, 0=unset) aligns the MONTH mode
-// to a specific day-of-month (clamped to month end). Both are ignored when 0 or
-// not applicable to the active mode.
-//
-// This is the ADVANCE form: it always steps at least one full interval into the
-// future relative to `from`, then snaps to the requested weekday / day-of-month.
-// Use it for the scheduler's post-run recompute and for toggle re-enable.
-//
-// Callers should enforce mutual exclusivity at the API boundary; this function
-// only fixes the precedence so a stray field can never silently change meaning.
+// NextRunWithInterval computes the next run time using one global priority order
+// (create/update/toggle all behave identically):
+//   1. intervalMonths>0 -> month stepping, clamped to month end (Jan31+1mo -> Feb28/29).
+//   2. intervalDays>0   -> fixed N*24h (day=N*1, week=N*7).
+//   3. otherwise        -> cron.
+// runTime ("HH:MM", Asia/Shanghai) anchors time-of-day for interval modes (empty keeps
+// from's); dayOfWeek (1..7,0=unset) aligns week mode, dayOfMonth (1..31,0=unset) month mode.
+// ADVANCE form: always steps at least one full interval past `from`.
 func NextRunWithInterval(cronExpr string, intervalDays int, intervalMonths int, runTime string, dayOfWeek int, dayOfMonth int, from time.Time) (time.Time, error) {
 	if err := ValidateInterval(cronExpr, intervalDays, intervalMonths); err != nil {
 		return time.Time{}, err
@@ -73,42 +51,22 @@ func NextRunWithInterval(cronExpr string, intervalDays int, intervalMonths int, 
 	return NextRun(cronExpr, from)
 }
 
-// NextRunScheduledAdvance computes the next_run for the scheduler's post-run
-// recompute. Unlike NextRunWithInterval (which steps a single interval from
-// `from`), this advances from the schedule's ORIGINAL due time (`anchor`,
-// i.e. *sched.NextRunAt) by whole periods until the result is strictly after
-// `now`, preserving the weekday / day-of-month phase.
-//
-// Why anchor, not now: if the scheduler fires late (e.g. a weekly Monday 09:00
-// schedule is only scanned Tuesday 10:00) computing from `now` would jump to
-// the week AFTER next and silently skip the just-missed Monday. Anchoring on
-// the original due time keeps the cadence: from Monday 09:00 we step +1 week to
-// next Monday 09:00, which is the correct nearest future occurrence.
-//
-// For interval modes a single full step is normally enough to pass `now`; the
-// loop only iterates more when the scheduler was down for multiple periods. We
-// cap iterations defensively so a pathological anchor far in the past cannot
-// spin forever. Cron mode is unchanged (cron.Next already returns the next
-// occurrence strictly after its argument, so we feed it `now`).
+// NextRunScheduledAdvance computes next_run for the scheduler's post-run recompute.
+// It advances from the schedule's ORIGINAL due time (`anchor`) by whole periods until
+// strictly after `now`, preserving weekday/day-of-month phase. Anchoring (not `now`)
+// keeps cadence when the scheduler fires late instead of skipping the missed occurrence.
 func NextRunScheduledAdvance(cronExpr string, intervalDays int, intervalMonths int, runTime string, dayOfWeek int, dayOfMonth int, anchor time.Time, now time.Time) (time.Time, error) {
 	if err := ValidateInterval(cronExpr, intervalDays, intervalMonths); err != nil {
 		return time.Time{}, err
 	}
-	// Cron mode: cron.Next is inherently "strictly after" semantics; anchoring
-	// is irrelevant because the cron expression fully defines the cadence.
 	if intervalMonths == 0 && intervalDays == 0 {
 		return NextRun(cronExpr, now)
 	}
 
-	// Defensive cap: at most ~ (10 years / shortest period) steps. Each loop
-	// advances at least one day, so 4000 iterations covers >10y of downtime.
-	const maxSteps = 4000
+	const maxSteps = 4000 // ~>10y of downtime; each loop advances >=1 day
 	if intervalMonths > 0 {
-		// Bug2 (PR#62 yujiawei r4): step whole months while keeping the target
-		// day-of-month anchored to the ORIGINAL anchor's day-of-month, not the
-		// clamped result of the previous step. See monthlyTargetDom + stepMonthTo
-		// for why feeding the clamped day back (the old behaviour) made the
-		// day-of-month monotonically decrease and never recover.
+		// Anchor the target day-of-month to the ORIGINAL anchor, not the clamped
+		// previous step, else day-of-month monotonically decreases and never recovers.
 		targetDom := monthlyTargetDom(anchor, dayOfMonth)
 		next := anchor
 		for i := 0; i < maxSteps; i++ {
@@ -142,22 +100,10 @@ func NextRunScheduledAdvance(cronExpr string, intervalDays int, intervalMonths i
 	return time.Time{}, fmt.Errorf("next_run exceeded %d advance steps from anchor %s (now=%s)", maxSteps, anchor, now)
 }
 
-// NextRunInitial computes the FIRST next_run at create/update time. Unlike the
-// ADVANCE form, if the user-selected time-of-day for the next valid day is still
-// ahead of `from` (now), it fires that day rather than waiting a full interval.
-// Concretely:
-//
-//   - Day mode (intervalDays not a multiple of 7, no weekday): candidate =
-//     today's run_time. If candidate > now -> run today; else advance N days.
-//   - Week mode (intervalDays multiple of 7): candidate = the next occurrence of
-//     dayOfWeek (or today's run_time if no weekday selected) at run_time. If
-//     that candidate (today, when today matches the weekday) is still ahead of
-//     now -> use it; otherwise the next matching weekday.
-//   - Month mode: candidate = this month's dayOfMonth (or today's day if unset)
-//     at run_time. If candidate > now -> this month; otherwise next month.
-//   - Cron mode: unchanged (cron already encodes the schedule).
-//
-// `from` must be in Asia/Shanghai.
+// NextRunInitial computes the FIRST next_run at create/update time. Unlike ADVANCE,
+// if the selected time-of-day for the next valid day is still ahead of `from`, it fires
+// that day rather than waiting a full interval (day/week/month each pick the nearest
+// valid run_time today/this period, else advance). Cron unchanged. `from` is Asia/Shanghai.
 func NextRunInitial(cronExpr string, intervalDays int, intervalMonths int, runTime string, dayOfWeek int, dayOfMonth int, from time.Time) (time.Time, error) {
 	if err := ValidateInterval(cronExpr, intervalDays, intervalMonths); err != nil {
 		return time.Time{}, err
@@ -238,64 +184,32 @@ func alignDayOfMonth(t time.Time, dom int) time.Time {
 	return time.Date(t.Year(), t.Month(), day, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())
 }
 
-// monthlyTargetDom (PR#62 r4 Bug2) resolves the stable "target day-of-month"
-// used by month-mode stepping. The scheduler overwrites next_run_at with each
-// computed (possibly clamped) result, so across cycles the `anchor` passed in is
-// the PREVIOUS step's output, not the original creation day. The target dom must
-// therefore be reconstructable from the (drifting) anchor alone and still
-// recover the intended day in long months.
-//
-//   - dayOfMonth in 1..31 (explicitly selected): that is the target, always.
-//     alignDayOfMonth clamps it to month end in short months but the target
-//     itself never drifts, so 1/31 -> 2/28 -> 3/31 recovers.
-//   - dayOfMonth == 0 ("不限" / unset) AND the anchor is the LAST day of its
-//     month: use end-of-month semantics (target 31). This is the case that was
-//     monotonically decreasing: a Jan-31 start clamps to Feb-28, and Feb-28 is
-//     itself the last day of February, so we keep targeting month-end and
-//     recover to Mar-31, Apr-30, May-31, ... The detection is self-consistent
-//     under next_run_at drift: every clamped month-end result is again a
-//     month-end day, so each subsequent cycle re-derives target 31.
-//   - dayOfMonth == 0 AND the anchor is NOT the last day of its month: the day
-//     exists in every month (1..28), so it never clamps and the anchor's own day
-//     is a stable target (e.g. the 15th stays the 15th).
+// monthlyTargetDom resolves the stable target day-of-month for month stepping, derived
+// from the (drifting) anchor alone: an explicit dayOfMonth (1..31) is the target; dayOfMonth==0
+// on a month-end anchor means "last day of each month" (target 31, so Jan31->Feb28->Mar31
+// recovers); otherwise the anchor's own day (e.g. the 15th stays the 15th).
 func monthlyTargetDom(anchor time.Time, dayOfMonth int) int {
 	if dayOfMonth >= 1 && dayOfMonth <= 31 {
 		return dayOfMonth
 	}
 	if anchor.Day() == daysInMonth(anchor.Year(), int(anchor.Month())) {
-		// Anchor sits on month end with no explicit day selected: treat as
-		// "last day of each month" so we recover to 31 in long months instead of
-		// sticking at a shorter month's length forever.
 		return 31
 	}
 	return anchor.Day()
 }
 
-// stepMonthTo (PR#62 r4 Bug2) advances `from` by n calendar months and snaps the
-// result to `targetDom` (clamped to the target month's length), then applies
-// runTime. Crucially it computes the day RELATIVE TO targetDom on every call, so
-// repeated stepping never carries a clamped day forward: from Jan 31 with
-// targetDom=31 we get Feb 28/29, then Mar 31, then Apr 30, ... Leap-year
-// February and December year-wrap fall out naturally from addMonthsClamped /
-// daysInMonth. With targetDom in 1..31 the alignDayOfMonth clamp is a no-op for
-// months that have the day and clamps to month-end otherwise.
+// stepMonthTo advances `from` by n months, snaps to targetDom (clamped to month length),
+// then applies runTime. The day is computed relative to targetDom every call, so a clamped
+// day is never carried forward (Jan31,targetDom=31 -> Feb28/29 -> Mar31 -> Apr30).
 func stepMonthTo(from time.Time, n int, runTime string, targetDom int) time.Time {
-	// Move to the target month first (addMonthsClamped keeps from's day-of-month
-	// or clamps to month end), then forcibly re-anchor to targetDom for that
-	// month so the previous step's clamped day is never propagated.
 	moved := addMonthsClamped(from, n)
 	aligned := alignDayOfMonth(moved, targetDom)
 	return applyRunTime(aligned, runTime)
 }
 
-// addMonthsClamped advances t by n calendar months. Go's time.AddDate rolls a
-// non-existent day over into the following month (e.g. Jan 31 + 1 month yields
-// Mar 3, because Feb 31 normalizes forward). That is surprising for a recurring
-// schedule: "every month on the 31st" should fire on the last day of months
-// that have no 31st. We detect the overflow (the resulting month is not the
-// expected target month) and clamp back to the last day of the target month,
-// preserving the time-of-day. This naturally handles Feb 28/29 (leap years) and
-// December year-wrap.
+// addMonthsClamped advances t by n calendar months, clamping a non-existent day to the
+// target month's last day (Jan31+1mo -> Feb28/29, not Go's Mar3 overflow). Handles leap
+// February and December year-wrap.
 func addMonthsClamped(t time.Time, n int) time.Time {
 	naive := t.AddDate(0, n, 0)
 

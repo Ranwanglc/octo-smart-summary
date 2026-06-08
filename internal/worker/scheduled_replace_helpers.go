@@ -139,22 +139,9 @@ func syncScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw mode
 	return nil
 }
 
-// saveLatestResultAndCompleteTask inserts the new result and marks the task
-// Completed (insert-then-delete-old + task-level CAS; version is monotonic via
-// GetNextVersion). The isScheduled flag controls VERSION RETENTION scope:
-//
-//   - isScheduled == true  (TriggerScheduled): keep only the just-inserted
-//     latest result + drop its chunks. Scheduled runs reuse one bound task and
-//     periodically overwrite it in place, so stale prior-cycle results must be
-//     pruned to a single current version.
-//   - isScheduled == false (manual / normal / team meta): KEEP all prior
-//     versions; only insert the new version and complete the task. Those paths
-//     intentionally accumulate a version history that the UI exposes, so the
-//     helper must NOT delete older results for them (Bug3: the prune used to run
-//     unconditionally and silently collapsed manual/team history to one row).
-//
-// The internal insert/CAS/version-monotonicity logic is unchanged; only the
-// old-version cleanup is now gated on isScheduled.
+// saveLatestResultAndCompleteTask inserts the new result and marks the task Completed.
+// isScheduled gates version retention: scheduled runs keep only the latest result (the bound
+// task is overwritten in place each cycle); manual/normal/team-meta keep full version history.
 func saveLatestResultAndCompleteTask(db *gorm.DB, taskID int64, result *model.SummaryResult, isScheduled bool) error {
 	return db.Transaction(func(tx *gorm.DB) error {
 		nextVer, err := service.GetNextVersion(tx, taskID)

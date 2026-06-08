@@ -67,43 +67,15 @@ var (
 	errTaskScopeMissingTaskID = errors.New("scope=task requires task_id")
 	errTaskScopeInvalidTask   = errors.New("scope=task task_id invalid")
 	errTaskScopeScheduleBound = errors.New("scope=task schedule already bound to another task")
-	// errMultiPersonNotSupported (PR#62 yujiawei r3, 方案A; r4 强化): scheduled
-	// summary is single-person only this version. This is the API-layer
-	// fail-closed guard that complements -- and runs IN ADDITION TO -- the
-	// worker-layer "Method A guard" in internal/worker/scheduler.go. Before this
-	// guard the API happily accepted a multi-person schedule (200 + next_run_at)
-	// while the scheduler silently skipped every cycle, so the user waited
-	// forever with no error and no result. We now reject multi-person at the door
-	// (HTTP 400) so the front-end can surface a clear message and never persists a
-	// schedule the scheduler will never run.
-	//
-	// r4 (PR#62 三位 reviewer 同时点名 Bug1): the r3 guard only blocked
-	// len(req.Participants) > 1. But the worker
-	// (scheduled_replace_helpers.go syncScheduledTaskParticipants) ALWAYS prepends
-	// task.CreatorID before appending the configured participants. So a request
-	// carrying exactly ONE participant that is NOT the task creator slipped through
-	// the > 1 guard, then the worker inflated it to 2 rows (creator + that other
-	// user) -> processor.go routed 2 participants into the multi-person team
-	// branch (unsupported for scheduled this version) -> task stuck Processing,
-	// submitted_at never written. The fix raises the API口径 to match the worker's
-	// effective set: a scheduled task may ONLY carry participants that are a subset
-	// of {task.CreatorID}. Any participant whose UserID != task.CreatorID (the
-	// exact set the worker would inflate past single-person) is rejected here.
+	// Scheduled summary is single-person only this version; reject multi-person at the API.
 	errMultiPersonNotSupported = errors.New("scheduled summary not supported for multi-person/team tasks")
-
-	// errLiveBindingDuplicate maps a MySQL 1062 hit on uk_live_schedule_binding to
-	// a clean 409 instead of a raw 500.
+	// MySQL 1062 on uk_live_schedule_binding mapped to a clean 409.
 	errLiveBindingDuplicate = errors.New("scope=task schedule live-binding unique index conflict (1062)")
-
-	// errRebindConcurrentModified: the non-locking pre-read of task.schedule_id
-	// went stale (a concurrent rebind changed it before we locked the task).
-	// Retryable.
+	// Pre-read of task.schedule_id went stale under a concurrent rebind; retryable.
 	errRebindConcurrentModified = errors.New("scope=task concurrent rebind detected, please retry")
 )
 
-// isMySQLDuplicateKey reports whether err is (or wraps) a MySQL 1062 duplicate
-// key. We match the raw driver error because TranslateError is off, so
-// gorm.ErrDuplicatedKey is not reliably returned.
+// isMySQLDuplicateKey reports whether err is (or wraps) a MySQL 1062 duplicate key.
 func isMySQLDuplicateKey(err error) bool {
 	if err == nil {
 		return false
@@ -115,19 +87,10 @@ func isMySQLDuplicateKey(err error) bool {
 	return errors.Is(err, gorm.ErrDuplicatedKey)
 }
 
-// teamScheduleNotSupportedMsg is the user-facing (Chinese) message returned for
-// the multi-person fail-closed guard. Pairs with code 40015 so the front-end
-// can route on the error code.
+// 40015 user-facing message for the multi-person guard.
 const teamScheduleNotSupportedMsg = "定时总结暂不支持多人/团队任务"
 
-// loadTaskParticipantCount counts the participants bound to a task using the
-// EXACT same measure as the worker-layer Method A guard
-// (internal/worker/scheduler.go): COUNT(*) of SummaryParticipant rows where
-// task_id = task.ID. Keeping the two口径 identical means a task the API accepts
-// as single-person is exactly the set the scheduler is willing to run, and a
-// task the API rejects as multi-person is exactly the set the scheduler would
-// have skipped. The caller passes the same `tx` it already holds (it has the
-// task locked FOR UPDATE), so this count is consistent with that snapshot.
+// loadTaskParticipantCount counts participants bound to a task (same measure as the worker guard).
 func loadTaskParticipantCount(tx *gorm.DB, taskID int64) (int64, error) {
 	var participantCount int64
 	if err := tx.Model(&model.SummaryParticipant{}).
@@ -138,18 +101,8 @@ func loadTaskParticipantCount(tx *gorm.DB, taskID int64) (int64, error) {
 	return participantCount, nil
 }
 
-// participantsSubsetOfCreator (PR#62 r4 Bug1) returns true iff every entry in
-// reqParticipants is the task creator. An empty/nil slice is a subset (vacuously
-// true). A participant with an empty UserID is treated as the creator (the
-// worker's appendUser skips empty UserIDs, so it never inflates the effective
-// set past the creator). Any participant whose non-empty UserID differs from
-// creatorID makes the scheduled task effectively multi-person once the worker
-// prepends the creator, so it must be rejected.
-//
-// This is the precise inverse of the worker's syncScheduledTaskParticipants
-// effective set: worker = {creator} ∪ {p.UserID for p in config, p.UserID != ""}.
-// We accept exactly when that union has cardinality <= 1, i.e. every configured
-// participant is the creator (or empty).
+// participantsSubsetOfCreator reports whether every configured participant is the creator
+// (empty UserID counts as creator). False means the worker would inflate it past single-person.
 func participantsSubsetOfCreator(reqParticipants []participantReq, creatorID string) bool {
 	for _, p := range reqParticipants {
 		if p.UserID == "" {
@@ -162,19 +115,9 @@ func participantsSubsetOfCreator(reqParticipants []participantReq, creatorID str
 	return true
 }
 
-// storedParticipantConfigSubsetOfCreator (PR#62 r5 Blocker2 / lml2468 Y1-bis)
-// applies the SAME participantsSubsetOfCreator口径 to the participant_config
-// already stored on a schedule (model.JSON). This closes the third instance of
-// the single-person hole: UpdateSchedule only validated when the caller sent
-// req.Participants != nil. When req.Participants == nil the bind path reuses the
-// schedule's STORED participant_config (loaded into sched.ParticipantConfig),
-// which was NEVER validated -- so a historically-dirty schedule whose stored
-// config contains a non-creator could still be bound and later inflated to
-// multi-person by the worker (scheduled_replace_helpers.go prepends creator then
-// appends the stored config). We deserialize the stored config with the exact
-// same shape the worker reads (user_id) and reject if it contains anyone other
-// than the creator. An empty/nil config is vacuously a subset (PASS), matching
-// the worker which then only has {creator}.
+// storedParticipantConfigSubsetOfCreator applies participantsSubsetOfCreator to a schedule's
+// stored participant_config, so a bind reusing stored config (req.Participants==nil) is also
+// rejected when it contains a non-creator. Empty config is a subset (PASS).
 func storedParticipantConfigSubsetOfCreator(raw model.JSON, creatorID string) bool {
 	if len(raw) == 0 {
 		return true
@@ -205,9 +148,8 @@ func validateEffectiveParticipantsSubsetOfCreator(reqParticipants []participantR
 	return nil
 }
 
-// peekTaskScheduleID reads only task.schedule_id WITHOUT locking, so the caller
-// can FOR UPDATE the schedule rows before locking the task (keeps the tx
-// schedule->task). The value is a candidate, re-validated after the task lock.
+// peekTaskScheduleID reads task.schedule_id without locking, so the caller can lock
+// the schedule rows before the task (keeps tx order schedule->task). Re-validated after the task lock.
 func peekTaskScheduleID(tx *gorm.DB, spaceID, userID string, taskID int64) (*int64, error) {
 	var row struct {
 		ScheduleID *int64
@@ -230,19 +172,9 @@ func int64PtrEqual(a, b *int64) bool {
 	return *a == *b
 }
 
-// lockScheduleForUpdate (PR#62 r5 Blocker1a / J2 lock-order) takes a FOR UPDATE
-// row lock on the target summary_schedule so that all concurrent task<->schedule
-// binding operations on the SAME schedule serialize. Without it two concurrent
-// PUTs binding DIFFERENT tasks to the SAME schedule could each read boundCount==0
-// (no DB uniqueness on summary_task.schedule_id) and both bind, breaking the
-// one-to-one invariant. Locking the schedule row first makes the second binder
-// block until the first commits, then see boundCount>0 and reject.
-//
-// It is also the anchor for the unified lock ORDER: handlers now lock
-// schedule -> task (matching the scheduler in internal/worker/scheduler.go,
-// which claims the schedule row then locks the bound task), eliminating the
-// task->schedule vs schedule->task cross-direction deadlock window
-// (lml2468 J2 non-blocking).
+// lockScheduleForUpdate FOR UPDATE-locks the target schedule row so concurrent binds on the
+// same schedule serialize. Locking schedule before task keeps handlers in the scheduler's
+// schedule->task order, avoiding the cross-direction deadlock.
 func lockScheduleForUpdate(tx *gorm.DB, scheduleID int64, spaceID string) (model.SummarySchedule, error) {
 	var locked model.SummarySchedule
 	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -267,19 +199,11 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		return
 	}
 
-	// 方案A (PR#62 yujiawei r3; r4 Bug1 强化): the multi-person fail-closed guard
-	// now needs task.CreatorID to decide whether the configured participants are a
-	// subset of {creator}. We therefore defer the participant check into the
-	// transaction below, right after loadTaskForTaskScope loads (and FOR-UPDATE
-	// locks) the bound task -- see the participantsSubsetOfCreator call there. The
-	// old r3 input-level `len(req.Participants) > 1` check is intentionally
-	// removed because it let through exactly the "1 non-creator participant" hole
-	// the worker would inflate to 2 rows.
+	// Multi-person guard needs task.CreatorID, so the participant check runs in the
+	// transaction after loadTaskForTaskScope locks the task.
 
 	now := timezone.Now()
-	// ValidateIntervalForWrite enforces interval-only writes (cron is legacy
-	// read+execute-only), bounds (overflow guard) and mutual exclusivity of
-	// interval_days / interval_months in one place.
+	// Interval-only writes: bounds + mutual exclusivity of interval_days/interval_months.
 	if err := service.ValidateIntervalForWrite(req.CronExpr, req.IntervalDays, req.IntervalMonths); err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
 		return
@@ -596,17 +520,8 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 1000 字符"})
 		return
 	}
-	// 方案A (PR#62 yujiawei r3; r4 Bug1 强化): API-layer fail-closed multi-person
-	// guard on update. Only check when the caller actually sends participants
-	// (req.Participants != nil); a nil slice means "leave participants untouched"
-	// and must not be treated as multi-person. r4: the口径 is no longer "count > 1"
-	// but "every configured participant must be the task creator" -- because the
-	// worker prepends task.CreatorID, a single non-creator participant still
-	// inflates the effective set to 2 and routes into the unsupported team branch.
-	// The creator here is the caller (userID): only the creator can own/modify
-	// this schedule (verified above via sched.CreatorID == userID) and only the
-	// creator can bind a task (loadTaskForTaskScope enforces task.CreatorID ==
-	// userID), so task.CreatorID == sched.CreatorID == userID for any legal bind.
+	// Fail-closed multi-person guard on update; only when participants are sent
+	// (nil = leave untouched). Stored-config bind path is checked later in the tx.
 	if req.Participants != nil && !participantsSubsetOfCreator(req.Participants, userID) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40015, Message: teamScheduleNotSupportedMsg})
 		return
@@ -895,13 +810,8 @@ func loadTaskForTaskScope(tx *gorm.DB, spaceID, userID string, taskID int64) (mo
 	if task.CreatorID != userID {
 		return model.SummaryTask{}, service.NewBizError(40004, "仅创建者可绑定定时", http.StatusForbidden)
 	}
-	// 方案A (PR#62 yujiawei r3): API-layer fail-closed multi-person guard on the
-	// bound task. The task is already locked FOR UPDATE above, so we count its
-	// SummaryParticipant rows under the same lock snapshot and with the exact
-	// same口径 as the worker Method A guard (participantCount > 1). If the task
-	// being bound is a team task, refuse to attach a schedule to it -- otherwise
-	// the schedule would be created/updated but the scheduler would skip it
-	// every cycle, leaving the user with a silently dead timer.
+	// Refuse binding a schedule to a multi-person task (same measure as the worker guard);
+	// otherwise the scheduler would skip it every cycle, leaving a silently dead timer.
 	participantCount, err := loadTaskParticipantCount(tx, task.ID)
 	if err != nil {
 		return model.SummaryTask{}, err
@@ -984,12 +894,8 @@ func (h *ScheduleHandler) ToggleSchedule(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40015, Message: teamScheduleNotSupportedMsg})
 			return
 		}
-		// CRITICAL: recompute next_run_at for ALL recurrence types on re-enable.
-		// Previously only cron was recomputed, so an interval task (cron_expr
-		// empty) kept its stale, already-past next_run_at and fired immediately
-		// on the next scan. Route through the same NextRunWithInterval used by
-		// create/update/scheduler so the next run is always at least one full
-		// interval (or next cron tick) into the future.
+		// Recompute next_run_at for ALL recurrence types on re-enable, else an interval
+		// task keeps a stale past next_run_at and fires immediately on the next scan.
 		nextRun, err := service.NextRunWithInterval(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, sched.DayOfWeek, sched.DayOfMonth, timezone.Now())
 		if err != nil {
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})

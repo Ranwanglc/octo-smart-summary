@@ -181,47 +181,50 @@ func TestLoadTaskForTaskScope_MultiPersonTaskRejected(t *testing.T) {
 
 // Regression: single-person create path still succeeds (1 participant, and a
 // task with exactly 1 bound participant binds fine).
-func TestCreateSchedule_SinglePersonStillAllowed(t *testing.T) {
-	db := setupScheduleDB(t)
-	h := NewScheduleHandler(db)
-	r := setupScheduleRouter(h)
-
-	now := time.Now().UTC()
-	task := model.SummaryTask{
-		TaskNo:         "PR62-R3-SP-OK",
-		SpaceID:        "space1",
-		CreatorID:      "creator1",
-		SummaryMode:    model.ModeByPerson,
-		TimeRangeStart: now,
-		TimeRangeEnd:   now,
+func TestCreateSchedule_SubsetOfCreatorAllowed(t *testing.T) {
+	// Participants that are a subset of {creator} (none / only creator) must bind successfully.
+	cases := []struct {
+		name         string
+		participants []map[string]interface{}
+	}{
+		{"single_person_creator", []map[string]interface{}{{"user_id": "creator1", "user_name": "creator1"}}},
+		{"zero_participants", nil},
+		{"only_creator", []map[string]interface{}{{"user_id": "creator1", "user_name": "creator1"}}},
 	}
-	if err := db.Create(&task).Error; err != nil {
-		t.Fatalf("create task: %v", err)
-	}
-	if err := db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "creator1"}).Error; err != nil {
-		t.Fatalf("create participant: %v", err)
-	}
-
-	w := doScheduleJSONRequest(t, r, http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
-		"title":           "solo schedule",
-		"scope":           "task",
-		"task_id":         task.ID,
-		"interval_days":   1,
-		"run_time":        "23:30",
-		"time_range_type": 2,
-		"participants": []map[string]interface{}{
-			{"user_id": "creator1", "user_name": "creator1"},
-		},
-	})
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
-	}
-	var gotTask model.SummaryTask
-	if err := db.First(&gotTask, task.ID).Error; err != nil {
-		t.Fatalf("reload task: %v", err)
-	}
-	if gotTask.ScheduleID == nil {
-		t.Fatalf("expected task bound to a schedule")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupScheduleDB(t)
+			r := setupScheduleRouter(NewScheduleHandler(db))
+			now := time.Now().UTC()
+			task := model.SummaryTask{
+				TaskNo: "PR62-SUBSET-" + tc.name, SpaceID: "space1", CreatorID: "creator1",
+				SummaryMode: model.ModeByPerson, TimeRangeStart: now, TimeRangeEnd: now,
+			}
+			if err := db.Create(&task).Error; err != nil {
+				t.Fatalf("create task: %v", err)
+			}
+			if err := db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "creator1"}).Error; err != nil {
+				t.Fatalf("create participant: %v", err)
+			}
+			body := map[string]interface{}{
+				"title": tc.name, "scope": "task", "task_id": task.ID,
+				"interval_days": 1, "run_time": "23:30", "time_range_type": 2,
+			}
+			if tc.participants != nil {
+				body["participants"] = tc.participants
+			}
+			w := doScheduleJSONRequest(t, r, http.MethodPost, "/api/v1/summary-schedules", body)
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+			}
+			var gotTask model.SummaryTask
+			if err := db.First(&gotTask, task.ID).Error; err != nil {
+				t.Fatalf("reload task: %v", err)
+			}
+			if gotTask.ScheduleID == nil {
+				t.Fatalf("expected task bound to a schedule")
+			}
+		})
 	}
 }
 
@@ -320,89 +323,8 @@ func TestUpdateSchedule_SingleNonCreatorParticipantRejected(t *testing.T) {
 	}
 }
 
-//  r4-3) CreateSchedule with ZERO participants still succeeds (subset of
-//        {creator} vacuously). The worker will prepend the creator -> 1 person.
-func TestCreateSchedule_ZeroParticipantsStillAllowed(t *testing.T) {
-	db := setupScheduleDB(t)
-	h := NewScheduleHandler(db)
-	r := setupScheduleRouter(h)
-
-	now := time.Now().UTC()
-	task := model.SummaryTask{
-		TaskNo:         "PR62-R4-ZEROP",
-		SpaceID:        "space1",
-		CreatorID:      "creator1",
-		SummaryMode:    model.ModeByPerson,
-		TimeRangeStart: now,
-		TimeRangeEnd:   now,
-	}
-	if err := db.Create(&task).Error; err != nil {
-		t.Fatalf("create task: %v", err)
-	}
-
-	w := doScheduleJSONRequest(t, r, http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
-		"title":           "zero participants",
-		"scope":           "task",
-		"task_id":         task.ID,
-		"interval_days":   1,
-		"run_time":        "23:30",
-		"time_range_type": 2,
-		// no participants key at all
-	})
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
-	}
-	var gotTask model.SummaryTask
-	if err := db.First(&gotTask, task.ID).Error; err != nil {
-		t.Fatalf("reload task: %v", err)
-	}
-	if gotTask.ScheduleID == nil {
-		t.Fatalf("expected task bound to a schedule")
-	}
-}
-
-//  r4-4) CreateSchedule with exactly the creator as the only participant still
-//        succeeds (subset of {creator}).
-func TestCreateSchedule_OnlyCreatorParticipantStillAllowed(t *testing.T) {
-	db := setupScheduleDB(t)
-	h := NewScheduleHandler(db)
-	r := setupScheduleRouter(h)
-
-	now := time.Now().UTC()
-	task := model.SummaryTask{
-		TaskNo:         "PR62-R4-ONLYCREATOR",
-		SpaceID:        "space1",
-		CreatorID:      "creator1",
-		SummaryMode:    model.ModeByPerson,
-		TimeRangeStart: now,
-		TimeRangeEnd:   now,
-	}
-	if err := db.Create(&task).Error; err != nil {
-		t.Fatalf("create task: %v", err)
-	}
-
-	w := doScheduleJSONRequest(t, r, http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
-		"title":           "only creator",
-		"scope":           "task",
-		"task_id":         task.ID,
-		"interval_days":   1,
-		"run_time":        "23:30",
-		"time_range_type": 2,
-		"participants": []map[string]interface{}{
-			{"user_id": "creator1", "user_name": "creator1"},
-		},
-	})
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
-	}
-	var gotTask model.SummaryTask
-	if err := db.First(&gotTask, task.ID).Error; err != nil {
-		t.Fatalf("reload task: %v", err)
-	}
-	if gotTask.ScheduleID == nil {
-		t.Fatalf("expected task bound to a schedule")
-	}
-}
+//  ZERO participants and only-creator are covered by the table-driven
+//  TestCreateSchedule_SubsetOfCreatorAllowed above.
 
 // r4 unit: participantsSubsetOfCreator truth table.
 func TestParticipantsSubsetOfCreator(t *testing.T) {

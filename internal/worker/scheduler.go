@@ -63,20 +63,10 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 		return 0, false, nil
 	}
 
-	// Compute next_run FIRST. If a schedule has dirty/illegal recurrence data
-	// (multiple sources, invalid cron, out-of-bounds interval) the recompute
-	// returns an error. Previously we created the task and only then computed
-	// next_run, and on error just `continue`d -- leaving next_run_at in the past
-	// so the same dirty row was re-scanned every 60s, re-creating a summary task
-	// each cycle and burning LLM cost. Now: if next_run can't be computed, we
-	// disable the schedule (is_active=0) and log an alert, then skip task
-	// creation entirely. A human can inspect/fix and re-enable.
-	//
-	// Bug2 fix: advance from the ORIGINAL due time (*sched.NextRunAt), not from
-	// `now`. A late scan (e.g. weekly Monday 09:00 scanned Tuesday 10:00) used to
-	// recompute from now and jump to the week AFTER next, silently skipping the
-	// just-missed Monday. NextRunScheduledAdvance steps whole periods from the
-	// anchor until strictly > now, keeping the weekday/day-of-month phase.
+	// Compute next_run FIRST: on dirty/illegal recurrence data, disable the schedule
+	// (is_active=0) and skip, instead of leaving next_run_at in the past and re-scanning
+	// (re-creating tasks + burning LLM cost) every 60s. Advance from the ORIGINAL due time
+	// (*sched.NextRunAt), not now, so a late scan doesn't skip the just-missed occurrence.
 	nextRun, err := service.NextRunScheduledAdvance(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, sched.DayOfWeek, sched.DayOfMonth, *sched.NextRunAt, now)
 	if err != nil {
 		log.Printf("[scheduler] ALERT schedule %d has invalid recurrence (%v); disabling to stop repeated re-scan/cost", sched.ID, err)
@@ -93,15 +83,10 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 	claimed := false
 	requeued := false
 
-	// Bug1 fix: the schedule-claim CAS (advancing last_run_at/next_run_at) and
-	// the task reset now live in the SAME transaction. Previously the CAS ran in
-	// its own statement and the reset in a SEPARATE db.Transaction; if the reset
-	// failed, next_run_at had already advanced so the row was no longer due and
-	// the task was never rescheduled -- a silently dropped cycle. By merging
-	// them, any technical failure rolls back BOTH (next_run_at stays put, the
-	// 60s scan retries next cycle). Business skips (no bound task, overlapping
-	// Processing, multi-person guard) still COMMIT the advanced next_run_at so we
-	// don't re-scan the same row forever; only real errors trigger rollback.
+	// The schedule-claim CAS and the task reset share ONE transaction: a reset failure
+	// rolls back the next_run_at advance too (60s scan retries), avoiding a dropped cycle.
+	// Business skips (no bound task, overlapping Processing, multi-person) still commit the
+	// advanced next_run_at to avoid re-scanning forever; only real errors roll back.
 	if err := db.Transaction(func(tx *gorm.DB) error {
 		claim := tx.Model(&model.SummarySchedule{}).
 			Where("id = ? AND is_active = 1 AND deleted_at IS NULL AND next_run_at = ?", sched.ID, *sched.NextRunAt).
@@ -138,17 +123,10 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 			return nil
 		}
 
-		// Method A guard: scheduled summary is single-person only this version.
-		// Multi-person (team) tasks are driven by the human meta flow
-		// (manual initiate + confirm + submit) and must NOT be reset/overwritten
-		// by the scheduler -- doing so resets participants, clears personal
-		// results and routes the task into the team meta link with no human
-		// confirmation, so meta never converges. We count participants on the
-		// locked bound task and skip any multi-person task here. The claim CAS
-		// above already advanced next_run_at, so this row is simply skipped this
-		// cycle (and will be re-claimed + re-skipped next cycle). That empty
-		// re-claim is EXPECTED, not a bug -- it is the cost of keeping team
-		// tasks out of the scheduled-reset path until team scheduling ships.
+		// Method A guard: scheduled summary is single-person only this version. Multi-person
+		// (team) tasks are driven by the human meta flow and must NOT be reset here. The claim
+		// CAS already advanced next_run_at, so a multi-person row is simply skipped (and
+		// re-claimed + re-skipped next cycle) until team scheduling ships -- expected, not a bug.
 		var participantCount int64
 		if err := tx.Model(&model.SummaryParticipant{}).
 			Where("task_id = ?", task.ID).
