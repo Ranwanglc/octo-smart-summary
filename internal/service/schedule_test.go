@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -430,6 +431,39 @@ func TestNextRunInitial_WeekDOWTodayPassed(t *testing.T) {
 	}
 }
 
+func TestNextRunInitial_MultiWeekDOWTodayPassed_UsesConfiguredInterval(t *testing.T) {
+	now := shTime(t, "2026-06-04T10:00:00+08:00") // Thu, today's 09:00 already passed
+	cases := []struct {
+		interval int
+		want     string
+	}{
+		{interval: 14, want: "2026-06-18T09:00:00+08:00"},
+		{interval: 21, want: "2026-06-25T09:00:00+08:00"},
+		{interval: 28, want: "2026-07-02T09:00:00+08:00"},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("interval_%d", tc.interval), func(t *testing.T) {
+			got, err := NextRunInitial("", tc.interval, 0, "09:00", 4 /*Thu*/, 0, now)
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			want := shTime(t, tc.want)
+			if !got.Equal(want) {
+				t.Fatalf("got %v want %v", got, want)
+			}
+
+			next, err := NextRunScheduledAdvance("", tc.interval, 0, "09:00", 4 /*Thu*/, 0, 0, got, got.Add(time.Second))
+			if err != nil {
+				t.Fatalf("advance err: %v", err)
+			}
+			wantNext := shTime(t, tc.want).AddDate(0, 0, tc.interval)
+			if !next.Equal(wantNext) {
+				t.Fatalf("advance got %v want %v", next, wantNext)
+			}
+		})
+	}
+}
+
 // Month mode with explicit day-of-month ahead in the same month.
 func TestNextRunInitial_MonthDOM(t *testing.T) {
 	now := shTime(t, "2026-06-04T10:00:00+08:00")
@@ -526,7 +560,7 @@ func TestNextRunInitial_TimezoneBeijing(t *testing.T) {
 func TestNextRunScheduledAdvance_WeekLateScanNoSkip(t *testing.T) {
 	anchor := shTime(t, "2026-06-08T09:00:00+08:00") // Mon (the missed due time)
 	now := shTime(t, "2026-06-09T10:00:00+08:00")    // Tue, scanned late
-	got, err := NextRunScheduledAdvance("", 7, 0, "09:00", 1, 0, anchor, now)
+	got, err := NextRunScheduledAdvance("", 7, 0, "09:00", 1, 0, 0, anchor, now)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -547,7 +581,7 @@ func TestNextRunScheduledAdvance_WeekLateScanNoSkip(t *testing.T) {
 func TestNextRunScheduledAdvance_WeekOnTime(t *testing.T) {
 	anchor := shTime(t, "2026-06-08T09:00:00+08:00") // Mon
 	now := shTime(t, "2026-06-08T09:00:30+08:00")    // 30s late
-	got, err := NextRunScheduledAdvance("", 7, 0, "09:00", 1, 0, anchor, now)
+	got, err := NextRunScheduledAdvance("", 7, 0, "09:00", 1, 0, 0, anchor, now)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -576,7 +610,7 @@ func TestNextRunScheduledAdvance_MultiWeekIntervals(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			anchor := shTime(t, tc.anchor)
 			now := shTime(t, tc.now)
-			got, err := NextRunScheduledAdvance("", tc.interval, 0, "09:00", 1, 0, anchor, now)
+			got, err := NextRunScheduledAdvance("", tc.interval, 0, "09:00", 1, 0, 0, anchor, now)
 			if err != nil {
 				t.Fatalf("err: %v", err)
 			}
@@ -596,7 +630,7 @@ func TestNextRunScheduledAdvance_MultiWeekIntervals(t *testing.T) {
 func TestNextRunScheduledAdvance_MultiPeriodDowntime(t *testing.T) {
 	anchor := shTime(t, "2026-06-08T09:00:00+08:00") // Mon
 	now := shTime(t, "2026-06-25T10:00:00+08:00")    // ~2.5 weeks later
-	got, err := NextRunScheduledAdvance("", 7, 0, "09:00", 1, 0, anchor, now)
+	got, err := NextRunScheduledAdvance("", 7, 0, "09:00", 1, 0, 0, anchor, now)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -610,7 +644,7 @@ func TestNextRunScheduledAdvance_MultiPeriodDowntime(t *testing.T) {
 func TestNextRunScheduledAdvance_DayMode(t *testing.T) {
 	anchor := shTime(t, "2026-06-08T09:00:00+08:00")
 	now := shTime(t, "2026-06-09T10:00:00+08:00") // late by ~1 day
-	got, err := NextRunScheduledAdvance("", 1, 0, "09:00", 0, 0, anchor, now)
+	got, err := NextRunScheduledAdvance("", 1, 0, "09:00", 0, 0, 0, anchor, now)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -625,7 +659,7 @@ func TestNextRunScheduledAdvance_DayMode(t *testing.T) {
 func TestNextRunScheduledAdvance_MonthClampLate(t *testing.T) {
 	anchor := shTime(t, "2026-01-31T09:00:00+08:00") // monthly on the 31st
 	now := shTime(t, "2026-02-05T10:00:00+08:00")    // scanned in Feb
-	got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 31, anchor, now)
+	got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 31, 31, anchor, now)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -640,7 +674,7 @@ func TestNextRunScheduledAdvance_MonthClampLate(t *testing.T) {
 func TestNextRunScheduledAdvance_CronUsesNow(t *testing.T) {
 	anchor := shTime(t, "2026-06-01T09:00:00+08:00")
 	now := shTime(t, "2026-06-09T10:00:00+08:00")
-	got, err := NextRunScheduledAdvance("0 9 * * *", 0, 0, "", 0, 0, anchor, now)
+	got, err := NextRunScheduledAdvance("0 9 * * *", 0, 0, "", 0, 0, 0, anchor, now)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -681,7 +715,7 @@ func TestNextRunScheduledAdvance_MonthDom0_NoMonotonicDecrease(t *testing.T) {
 	for i, w := range want {
 		// now just below cur so exactly one step is taken each iteration.
 		now := cur.Add(time.Second)
-		got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 0, cur, now)
+		got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 0, 31, cur, now)
 		if err != nil {
 			t.Fatalf("step %d err: %v", i, err)
 		}
@@ -699,7 +733,7 @@ func TestNextRunScheduledAdvance_MonthDom0_NoMonotonicDecrease(t *testing.T) {
 func TestNextRunScheduledAdvance_MonthDom0_LeapFebruary(t *testing.T) {
 	anchor := shTime(t, "2028-01-31T09:00:00+08:00")
 	now := anchor.Add(time.Second)
-	got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 0, anchor, now)
+	got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 0, 31, anchor, now)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -708,7 +742,7 @@ func TestNextRunScheduledAdvance_MonthDom0_LeapFebruary(t *testing.T) {
 		t.Fatalf("leap feb: got %v want %v", got, want)
 	}
 	// Next step from Feb 29 must recover to Mar 31, not stick at 29.
-	got2, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 0, got, got.Add(time.Second))
+	got2, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 0, 31, got, got.Add(time.Second))
 	if err != nil {
 		t.Fatalf("err2: %v", err)
 	}
@@ -722,14 +756,14 @@ func TestNextRunScheduledAdvance_MonthDom0_LeapFebruary(t *testing.T) {
 func TestNextRunScheduledAdvance_MonthExplicitDom31_Recovers(t *testing.T) {
 	anchor := shTime(t, "2026-01-31T09:00:00+08:00")
 	now := anchor.Add(time.Second)
-	got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 31, anchor, now)
+	got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 31, 31, anchor, now)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	if want := shTime(t, "2026-02-28T09:00:00+08:00"); !got.Equal(want) {
 		t.Fatalf("dom31 feb: got %v want %v", got, want)
 	}
-	got2, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 31, got, got.Add(time.Second))
+	got2, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 31, 31, got, got.Add(time.Second))
 	if err != nil {
 		t.Fatalf("err2: %v", err)
 	}
@@ -743,11 +777,90 @@ func TestNextRunScheduledAdvance_MonthExplicitDom31_Recovers(t *testing.T) {
 func TestNextRunScheduledAdvance_MonthExplicitDom15_Stable(t *testing.T) {
 	anchor := shTime(t, "2026-01-15T09:00:00+08:00")
 	now := anchor.Add(time.Second)
-	got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 15, anchor, now)
+	got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 15, 15, anchor, now)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	if want := shTime(t, "2026-02-15T09:00:00+08:00"); !got.Equal(want) {
 		t.Fatalf("dom15: got %v want %v", got, want)
+	}
+}
+
+func TestNextRunScheduledAdvance_MonthDom0_UnknownAnchorStaysClampedValue(t *testing.T) {
+	anchor := shTime(t, "2026-02-28T09:00:00+08:00")
+	want := []string{
+		"2026-03-28T09:00:00+08:00",
+		"2026-04-28T09:00:00+08:00",
+		"2026-05-28T09:00:00+08:00",
+	}
+
+	cur := anchor
+	for i, w := range want {
+		got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 0, 0, cur, cur.Add(time.Second))
+		if err != nil {
+			t.Fatalf("step %d err: %v", i, err)
+		}
+		wantT := shTime(t, w)
+		if !got.Equal(wantT) {
+			t.Fatalf("step %d: got %v want %v", i, got, wantT)
+		}
+		if got.Day() != 28 {
+			t.Fatalf("step %d: day drifted to %d, want stable 28", i, got.Day())
+		}
+		if got.Month() == time.March && got.Day() == 31 {
+			t.Fatalf("step %d: unknown anchorDOM must not upgrade Feb 28 to month-end", i)
+		}
+		cur = got
+	}
+}
+
+func TestNextRunScheduledAdvance_MonthDom0_RecoversOriginalDOM30(t *testing.T) {
+	anchor := shTime(t, "2026-01-30T09:00:00+08:00")
+	febNow := anchor.Add(time.Second)
+	got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 0, 30, anchor, febNow)
+	if err != nil {
+		t.Fatalf("feb err: %v", err)
+	}
+	if want := shTime(t, "2026-02-28T09:00:00+08:00"); !got.Equal(want) {
+		t.Fatalf("feb: got %v want %v", got, want)
+	}
+
+	got2, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 0, 30, got, got.Add(time.Second))
+	if err != nil {
+		t.Fatalf("mar err: %v", err)
+	}
+	if want := shTime(t, "2026-03-30T09:00:00+08:00"); !got2.Equal(want) {
+		t.Fatalf("mar: got %v want %v", got2, want)
+	}
+}
+
+func TestComputeTimeRange_SinceLastRunUsesLastRunAt(t *testing.T) {
+	now := shTime(t, "2026-06-08T10:00:00+08:00")
+	lastRunAt := shTime(t, "2026-06-05T17:00:00+08:00")
+	start, end, err := ComputeTimeRange(4, now, &lastRunAt, "", 7, 0)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !start.Equal(lastRunAt) || !end.Equal(now) {
+		t.Fatalf("got [%v,%v] want [%v,%v]", start, end, lastRunAt, now)
+	}
+}
+
+func TestComputeTimeRange_SinceLastRunFirstRunFallsBackToCadence(t *testing.T) {
+	now := shTime(t, "2026-06-08T10:00:00+08:00")
+	start, end, err := ComputeTimeRange(4, now, nil, "", 7, 0)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	wantStart := shTime(t, "2026-06-01T10:00:00+08:00")
+	if !start.Equal(wantStart) || !end.Equal(now) {
+		t.Fatalf("got [%v,%v] want [%v,%v]", start, end, wantStart, now)
+	}
+}
+
+func TestComputeTimeRange_InvalidTypeErrors(t *testing.T) {
+	now := shTime(t, "2026-06-08T10:00:00+08:00")
+	if _, _, err := ComputeTimeRange(99, now, nil, "", 1, 0); err == nil {
+		t.Fatalf("expected invalid time_range_type error")
 	}
 }

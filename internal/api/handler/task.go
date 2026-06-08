@@ -816,11 +816,34 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 
 	now := timezone.Now()
 	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		peekedScheduleID, err := peekTaskScheduleID(tx, task.SpaceID, middleware.GetUserID(c), task.ID)
+		if err != nil {
+			return err
+		}
+
+		var lockedSched *model.SummarySchedule
+		if peekedScheduleID != nil {
+			var sched model.SummarySchedule
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND deleted_at IS NULL", *peekedScheduleID).
+				First(&sched).Error; err != nil {
+				if !errors.Is(err, gorm.ErrRecordNotFound) {
+					return err
+				}
+			} else {
+				lockedSched = &sched
+			}
+		}
+
 		var liveTask model.SummaryTask
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND deleted_at IS NULL", task.ID).
 			First(&liveTask).Error; err != nil {
 			return err
+		}
+
+		if !int64PtrEqual(liveTask.ScheduleID, peekedScheduleID) {
+			return errRebindConcurrentModified
 		}
 
 		if liveTask.ScheduleID != nil {
@@ -832,16 +855,11 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 			// creator; otherwise we just unbind (clear schedule_id) so the task
 			// delete still succeeds but the victim's schedule survives.
 			userID := middleware.GetUserID(c)
-			var sched model.SummarySchedule
-			if err := tx.Where("id = ? AND deleted_at IS NULL", *liveTask.ScheduleID).
-				First(&sched).Error; err != nil {
-				if !errors.Is(err, gorm.ErrRecordNotFound) {
-					return err
-				}
+			if lockedSched == nil {
 				// schedule already gone; nothing to cascade
-			} else if sched.CreatorID == userID {
+			} else if lockedSched.CreatorID == userID {
 				if err := tx.Model(&model.SummarySchedule{}).
-					Where("id = ? AND deleted_at IS NULL", sched.ID).
+					Where("id = ? AND deleted_at IS NULL", lockedSched.ID).
 					Update("deleted_at", &now).Error; err != nil {
 					return err
 				}
@@ -853,7 +871,7 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 					Update("schedule_id", nil).Error; err != nil {
 					return err
 				}
-				log.Printf("[task] DeleteSummary: task %d caller %s is not schedule %d creator; unbinding instead of cascade-deleting", liveTask.ID, userID, sched.ID)
+				log.Printf("[task] DeleteSummary: task %d caller %s is not schedule %d creator; unbinding instead of cascade-deleting", liveTask.ID, userID, lockedSched.ID)
 			}
 		}
 
@@ -864,6 +882,10 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 	}); err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+			return
+		}
+		if errors.Is(err, errRebindConcurrentModified) {
+			c.JSON(http.StatusConflict, apiResponse{Code: 40916, Message: "绑定状态被并发修改，请重试"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})

@@ -27,9 +27,10 @@ func NextRun(cronExpr string, from time.Time) (time.Time, error) {
 
 // NextRunWithInterval computes the next run time using one global priority order
 // (create/update/toggle all behave identically):
-//   1. intervalMonths>0 -> month stepping, clamped to month end (Jan31+1mo -> Feb28/29).
-//   2. intervalDays>0   -> fixed N*24h (day=N*1, week=N*7).
-//   3. otherwise        -> cron.
+//  1. intervalMonths>0 -> month stepping, clamped to month end (Jan31+1mo -> Feb28/29).
+//  2. intervalDays>0   -> fixed N*24h (day=N*1, week=N*7).
+//  3. otherwise        -> cron.
+//
 // runTime ("HH:MM", Asia/Shanghai) anchors time-of-day for interval modes (empty keeps
 // from's); dayOfWeek (1..7,0=unset) aligns week mode, dayOfMonth (1..31,0=unset) month mode.
 // ADVANCE form: always steps at least one full interval past `from`.
@@ -55,7 +56,7 @@ func NextRunWithInterval(cronExpr string, intervalDays int, intervalMonths int, 
 // It advances from the schedule's ORIGINAL due time (`anchor`) by whole periods until
 // strictly after `now`, preserving weekday/day-of-month phase. Anchoring (not `now`)
 // keeps cadence when the scheduler fires late instead of skipping the missed occurrence.
-func NextRunScheduledAdvance(cronExpr string, intervalDays int, intervalMonths int, runTime string, dayOfWeek int, dayOfMonth int, anchor time.Time, now time.Time) (time.Time, error) {
+func NextRunScheduledAdvance(cronExpr string, intervalDays int, intervalMonths int, runTime string, dayOfWeek int, dayOfMonth int, anchorDOM int, anchor time.Time, now time.Time) (time.Time, error) {
 	if err := ValidateInterval(cronExpr, intervalDays, intervalMonths); err != nil {
 		return time.Time{}, err
 	}
@@ -65,9 +66,7 @@ func NextRunScheduledAdvance(cronExpr string, intervalDays int, intervalMonths i
 
 	const maxSteps = 4000 // ~>10y of downtime; each loop advances >=1 day
 	if intervalMonths > 0 {
-		// Anchor the target day-of-month to the ORIGINAL anchor, not the clamped
-		// previous step, else day-of-month monotonically decreases and never recovers.
-		targetDom := monthlyTargetDom(anchor, dayOfMonth)
+		targetDom := monthlyTargetDom(anchorDOM, anchor, dayOfMonth)
 		next := anchor
 		for i := 0; i < maxSteps; i++ {
 			stepped := stepMonthTo(next, intervalMonths, runTime, targetDom)
@@ -131,9 +130,13 @@ func NextRunInitial(cronExpr string, intervalDays int, intervalMonths int, runTi
 			// counts when today is the weekday and the time hasn't passed).
 			candidate := alignDayOfWeek(applyRunTime(from, runTime), dayOfWeek)
 			// alignDayOfWeek moves forward to the weekday (could be today). If the
-			// aligned candidate is today but the time already passed, push a week.
+			// aligned candidate is today but the time already passed, advance by
+			// the configured interval first, then re-align weekday. Using a fixed
+			// +7d here breaks multi-week intervals (14/21/28...) by starting one
+			// week too early and permanently skewing cadence.
 			if !candidate.After(from) {
-				candidate = candidate.Add(7 * 24 * time.Hour)
+				base := applyRunTime(from.Add(time.Duration(intervalDays)*24*time.Hour), runTime)
+				candidate = alignDayOfWeek(base, dayOfWeek)
 			}
 			return candidate, nil
 		}
@@ -184,16 +187,26 @@ func alignDayOfMonth(t time.Time, dom int) time.Time {
 	return time.Date(t.Year(), t.Month(), day, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())
 }
 
-// monthlyTargetDom resolves the stable target day-of-month for month stepping, derived
-// from the (drifting) anchor alone: an explicit dayOfMonth (1..31) is the target; dayOfMonth==0
-// on a month-end anchor means "last day of each month" (target 31, so Jan31->Feb28->Mar31
-// recovers); otherwise the anchor's own day (e.g. the 15th stays the 15th).
-func monthlyTargetDom(anchor time.Time, dayOfMonth int) int {
+// monthlyTargetDom resolves the stable target day-of-month for month stepping.
+// Only explicit monthly intent may upgrade to "month end": dayOfMonth/anchorDOM
+// in [1,31] win. Legacy rows with anchorDOM<=0 are treated conservatively and
+// keep anchoring on the current anchor's own day, even if that day happens to
+// be the month's last day due to a previous clamp. This prevents unknown legacy
+// rows clamped to Feb 28 / Apr 30 from being mis-upgraded into permanent
+// month-end schedules.
+func ResolveAnchorDOM(dayOfMonth int, from time.Time) int {
 	if dayOfMonth >= 1 && dayOfMonth <= 31 {
 		return dayOfMonth
 	}
-	if anchor.Day() == daysInMonth(anchor.Year(), int(anchor.Month())) {
-		return 31
+	return from.Day()
+}
+
+func monthlyTargetDom(anchorDOM int, anchor time.Time, dayOfMonth int) int {
+	if dayOfMonth >= 1 && dayOfMonth <= 31 {
+		return dayOfMonth
+	}
+	if anchorDOM >= 1 && anchorDOM <= 31 {
+		return anchorDOM
 	}
 	return anchor.Day()
 }
@@ -322,6 +335,13 @@ func ValidateDayOfMonth(dom int) error {
 	return nil
 }
 
+func ValidateTimeRangeType(rangeType int) error {
+	if rangeType >= 1 && rangeType <= 4 {
+		return nil
+	}
+	return fmt.Errorf("time_range_type 必须为 1..4")
+}
+
 // ValidateIntervalForWrite is the stricter create/update gate. Cron is now a
 // legacy, read+execute-only mode: the public write contract is interval-only
 // (exactly one of day/week via interval_days, or month via interval_months).
@@ -405,8 +425,24 @@ func ValidateInterval(cronExpr string, intervalDays int, intervalMonths int) err
 	return nil
 }
 
+func cadenceWindowStart(now time.Time, lastRunAt *time.Time, cronExpr string, intervalDays int, intervalMonths int) (time.Time, error) {
+	if lastRunAt != nil {
+		return *lastRunAt, nil
+	}
+	switch {
+	case intervalMonths > 0:
+		return addMonthsClamped(now, -intervalMonths), nil
+	case intervalDays > 0:
+		return now.Add(-time.Duration(intervalDays) * 24 * time.Hour), nil
+	case cronExpr != "":
+		return now.Add(-24 * time.Hour), nil
+	default:
+		return time.Time{}, fmt.Errorf("invalid recurrence for time_range_type=4")
+	}
+}
+
 // ComputeTimeRange returns (start, end) based on time_range_type.
-func ComputeTimeRange(rangeType int, now time.Time) (time.Time, time.Time) {
+func ComputeTimeRange(rangeType int, now time.Time, lastRunAt *time.Time, cronExpr string, intervalDays int, intervalMonths int) (time.Time, time.Time, error) {
 	end := now
 	var start time.Time
 	switch rangeType {
@@ -416,8 +452,14 @@ func ComputeTimeRange(rangeType int, now time.Time) (time.Time, time.Time) {
 		start = now.Add(-7 * 24 * time.Hour)
 	case 3:
 		start = now.Add(-30 * 24 * time.Hour)
-	default: // type 4 — since last run, fallback to 24h
-		start = now.Add(-24 * time.Hour)
+	case 4:
+		var err error
+		start, err = cadenceWindowStart(now, lastRunAt, cronExpr, intervalDays, intervalMonths)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+	default:
+		return time.Time{}, time.Time{}, fmt.Errorf("unsupported time_range_type=%d", rangeType)
 	}
-	return start, end
+	return start, end, nil
 }

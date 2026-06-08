@@ -760,6 +760,14 @@ func TestToggleSchedule_EnableFailsOnInvalidRecurrence(t *testing.T) {
 	if err := db.Model(&sched).Update("is_active", 0).Error; err != nil {
 		t.Fatalf("disable sched: %v", err)
 	}
+	now := time.Now().UTC()
+	task := model.SummaryTask{TaskNo: "TOGGLE-BAD", SpaceID: "space1", CreatorID: "creator1", SummaryMode: model.ModeByPerson, TimeRangeStart: now, TimeRangeEnd: now, ScheduleID: &sched.ID}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if err := db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", Status: model.ParticipantAccepted}).Error; err != nil {
+		t.Fatalf("create participant: %v", err)
+	}
 
 	w := doScheduleJSONRequest(t, r, http.MethodPut, "/api/v1/summary-schedules/"+itoa(sched.ID)+"/toggle", map[string]interface{}{
 		"is_active": true,

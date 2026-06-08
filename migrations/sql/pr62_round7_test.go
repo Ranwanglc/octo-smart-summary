@@ -8,11 +8,9 @@ import (
 	"gorm.io/gorm"
 )
 
-// PR#62 r7 Blocker1: the unique-binding migration self-heals double-bound rows
-// BEFORE ADD UNIQUE so it never fails on historical dirty data. The MySQL UPDATE
-// uses a JOIN+derived table (not portable to sqlite), so we pin the cleanup
-// SEMANTICS with the equivalent portable statement and assert the file actually
-// performs the cleanup ahead of ADD UNIQUE.
+// PR#62 r7 Blocker1: the unique-binding migration keeps the self-heal UPDATE
+// and DDL together in the original 01 file. We pin the cleanup SEMANTICS with
+// a portable sqlite UPDATE and assert 01 still carries the real work.
 
 func TestPR62Round7_UniqueBinding_SelfHealKeepsOneRow(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
@@ -67,16 +65,24 @@ func TestPR62Round7_UniqueBinding_SelfHealKeepsOneRow(t *testing.T) {
 		t.Fatalf("schedule 1 kept id=%d want 1 (min)", kept)
 	}
 
-	// File assertion: the unbind UPDATE precedes ADD UNIQUE.
-	raw, err := FS.ReadFile("20260608-01-unique-live-schedule-binding.sql")
+	bodyBytes, err := FS.ReadFile("20260608-01-unique-live-schedule-binding.sql")
 	if err != nil {
-		t.Fatalf("read migration: %v", err)
+		t.Fatalf("read migration 01: %v", err)
 	}
-	body := string(raw)
-	updIdx := strings.Index(body, "UPDATE summary_task")
-	uniqIdx := strings.Index(body, "ADD UNIQUE KEY uk_live_schedule_binding")
-	if updIdx < 0 || uniqIdx < 0 || updIdx > uniqIdx {
-		t.Fatalf("cleanup UPDATE must precede ADD UNIQUE (upd=%d uniq=%d)", updIdx, uniqIdx)
+	body := string(bodyBytes)
+	for _, want := range []string{"UPDATE summary_task", "ADD COLUMN live_schedule_id", "ADD UNIQUE KEY uk_live_schedule_binding"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("01 missing %q", want)
+		}
+	}
+	for _, removed := range []string{
+		"20260608-01a-heal-live-schedule-binding.sql",
+		"20260608-01b-add-live-schedule-id.sql",
+		"20260608-01c-add-unique-live-schedule-binding.sql",
+	} {
+		if _, err := FS.ReadFile(removed); err == nil {
+			t.Fatalf("%s should not exist after restoring unsplit 01", removed)
+		}
 	}
 }
 

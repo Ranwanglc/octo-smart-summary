@@ -173,7 +173,10 @@ func TestClaimAndCreateScheduledTask_ConcurrentClaimReusesOneTask(t *testing.T) 
 	if err := db.First(&updatedTask, task.ID).Error; err != nil {
 		t.Fatalf("reload task: %v", err)
 	}
-	wantStart, wantEnd := service.ComputeTimeRange(sched.TimeRangeType, now)
+	wantStart, wantEnd, err := service.ComputeTimeRange(sched.TimeRangeType, now, nil, sched.CronExpr, sched.IntervalDays, sched.IntervalMonths)
+	if err != nil {
+		t.Fatalf("want time range: %v", err)
+	}
 	if updatedTask.ID != task.ID {
 		t.Fatalf("task id changed: got %d want %d", updatedTask.ID, task.ID)
 	}
@@ -613,7 +616,7 @@ func TestClaimAndCreateScheduledTask_ReloadsLatestScheduleConfigBeforeClaim(t *t
 		t.Fatalf("claimed=%v taskID=%d want claimed=true taskID=%d", claimed, taskID, task.ID)
 	}
 
-	wantNextRun, err := service.NextRunScheduledAdvance("", 7, 0, "18:45", 0, 0, due, now)
+	wantNextRun, err := service.NextRunScheduledAdvance("", 7, 0, "18:45", 0, 0, 0, due, now)
 	if err != nil {
 		t.Fatalf("want next run: %v", err)
 	}
@@ -625,7 +628,10 @@ func TestClaimAndCreateScheduledTask_ReloadsLatestScheduleConfigBeforeClaim(t *t
 		t.Fatalf("next_run_at=%v want %v", reloadedSched.NextRunAt, wantNextRun)
 	}
 
-	wantStart, wantEnd := service.ComputeTimeRange(3, now)
+	wantStart, wantEnd, err := service.ComputeTimeRange(3, now, nil, "", 7, 0)
+	if err != nil {
+		t.Fatalf("want time range: %v", err)
+	}
 	var reloadedTask model.SummaryTask
 	if err := db.First(&reloadedTask, task.ID).Error; err != nil {
 		t.Fatalf("reload task: %v", err)
@@ -644,6 +650,108 @@ func TestClaimAndCreateScheduledTask_ReloadsLatestScheduleConfigBeforeClaim(t *t
 	}
 	if sources[0].SourceID != "dm-user-2" || sources[0].SourceType != 3 {
 		t.Fatalf("expected latest source config applied, got %+v", sources[0])
+	}
+}
+
+func TestClaimAndCreateScheduledTask_TimeRangeType4UsesLastRunAt(t *testing.T) {
+	db := setupSchedulerTestDB(t)
+	now := timezone.Now()
+	lastRunAt := now.Add(-9 * 24 * time.Hour)
+	due := now.Add(-time.Minute)
+
+	sched := model.SummarySchedule{
+		SpaceID:       "space1",
+		CreatorID:     "creator1",
+		Title:         "Since last run",
+		SummaryMode:   model.ModeByPerson,
+		IntervalDays:  7,
+		RunTime:       "09:00",
+		TimeRangeType: 4,
+		IsActive:      1,
+		LastRunAt:     &lastRunAt,
+		NextRunAt:     &due,
+	}
+	if err := db.Create(&sched).Error; err != nil {
+		t.Fatalf("create schedule: %v", err)
+	}
+	task := model.SummaryTask{
+		TaskNo:         "task-since-last-run",
+		SpaceID:        sched.SpaceID,
+		CreatorID:      sched.CreatorID,
+		Title:          "Since last run",
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: now.Add(-24 * time.Hour),
+		TimeRangeEnd:   now.Add(-12 * time.Hour),
+		Status:         model.StatusCompleted,
+		TriggerType:    model.TriggerManual,
+		ScheduleID:     &sched.ID,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	participant := model.SummaryParticipant{TaskID: task.ID, UserID: sched.CreatorID, UserName: "Creator", Status: model.ParticipantAccepted}
+	if err := db.Create(&participant).Error; err != nil {
+		t.Fatalf("create participant: %v", err)
+	}
+	pr := model.PersonalResult{TaskID: task.ID, ParticipantRefID: participant.ID, UserID: sched.CreatorID, WorkerStatus: model.PersonalStatusCompleted}
+	if err := db.Create(&pr).Error; err != nil {
+		t.Fatalf("create personal result: %v", err)
+	}
+	if err := db.Model(&participant).Update("personal_result_id", pr.ID).Error; err != nil {
+		t.Fatalf("bind personal result: %v", err)
+	}
+
+	taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now)
+	if err != nil {
+		t.Fatalf("claim err: %v", err)
+	}
+	if !claimed || taskID != task.ID {
+		t.Fatalf("claimed=%v taskID=%d want claimed=true taskID=%d", claimed, taskID, task.ID)
+	}
+
+	var reloadedTask model.SummaryTask
+	if err := db.First(&reloadedTask, task.ID).Error; err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if !reloadedTask.TimeRangeStart.Equal(lastRunAt) || !reloadedTask.TimeRangeEnd.Equal(now) {
+		t.Fatalf("time range=[%v,%v] want [%v,%v]", reloadedTask.TimeRangeStart, reloadedTask.TimeRangeEnd, lastRunAt, now)
+	}
+}
+
+func TestClaimAndCreateScheduledTask_InvalidTimeRangeDisablesSchedule(t *testing.T) {
+	db := setupSchedulerTestDB(t)
+	now := timezone.Now()
+	due := now.Add(-time.Minute)
+
+	sched := model.SummarySchedule{
+		SpaceID:       "space1",
+		CreatorID:     "creator1",
+		Title:         "Bad range",
+		SummaryMode:   model.ModeByPerson,
+		IntervalDays:  1,
+		RunTime:       "09:00",
+		TimeRangeType: 99,
+		IsActive:      1,
+		NextRunAt:     &due,
+	}
+	if err := db.Create(&sched).Error; err != nil {
+		t.Fatalf("create schedule: %v", err)
+	}
+
+	taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now)
+	if err != nil {
+		t.Fatalf("claim err: %v", err)
+	}
+	if claimed || taskID != 0 {
+		t.Fatalf("claimed=%v taskID=%d want claimed=false taskID=0", claimed, taskID)
+	}
+
+	var reloaded model.SummarySchedule
+	if err := db.First(&reloaded, sched.ID).Error; err != nil {
+		t.Fatalf("reload schedule: %v", err)
+	}
+	if reloaded.IsActive != 0 {
+		t.Fatalf("schedule should be disabled on invalid time range, got is_active=%d", reloaded.IsActive)
 	}
 }
 

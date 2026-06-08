@@ -3,9 +3,31 @@ package handler
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"gorm.io/gorm"
 )
+
+func bindToggleTask(t *testing.T, db *gorm.DB, sched *model.SummarySchedule, creator string) {
+	t.Helper()
+	now := time.Now().UTC()
+	task := model.SummaryTask{
+		TaskNo:         "toggle-" + itoa(sched.ID) + "-" + creator,
+		SpaceID:        sched.SpaceID,
+		CreatorID:      creator,
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: now,
+		TimeRangeEnd:   now,
+		ScheduleID:     &sched.ID,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if err := db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: creator, Status: model.ParticipantAccepted}).Error; err != nil {
+		t.Fatalf("create participant: %v", err)
+	}
+}
 
 // PR#62 r7 Blocker2: ToggleSchedule re-enable is the 4th single-person entry
 // point and must apply the same stored-config subset guard.
@@ -30,6 +52,7 @@ func TestPR62Round7_Toggle_ReenableDirtyConfig_Rejected(t *testing.T) {
 	}
 	// is_active has DB default 1; force the disabled start state.
 	db.Model(&sched).Update("is_active", 0)
+	bindToggleTask(t, db, &sched, "creator1")
 
 	w := doScheduleJSONRequest(t, r, http.MethodPut, "/api/v1/summary-schedules/"+itoa(sched.ID)+"/toggle", map[string]interface{}{
 		"is_active": true,
@@ -72,6 +95,7 @@ func TestPR62Round7_Toggle_ReenableCleanConfig_Allowed(t *testing.T) {
 				t.Fatalf("create sched: %v", err)
 			}
 			db.Model(&sched).Update("is_active", 0)
+			bindToggleTask(t, db, &sched, "creator1")
 			w := doScheduleJSONRequest(t, r, http.MethodPut, "/api/v1/summary-schedules/"+itoa(sched.ID)+"/toggle", map[string]interface{}{
 				"is_active": true,
 			})

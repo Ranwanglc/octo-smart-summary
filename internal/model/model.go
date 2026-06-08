@@ -287,6 +287,7 @@ type SummarySchedule struct {
 	// DayOfMonth aligns MONTH mode (interval_months>0) to a specific day:
 	// 1..31 (clamped to month end), 0=unconstrained. Ignored for non-month modes.
 	DayOfMonth        int        `gorm:"column:day_of_month;type:tinyint;not null;default:0" json:"day_of_month"`
+	AnchorDOM         int        `gorm:"column:anchor_dom;type:tinyint;not null;default:0" json:"-"`
 	TimeRangeType     int        `gorm:"column:time_range_type;type:tinyint;not null" json:"time_range_type"`
 	SourceConfig      JSON       `gorm:"column:source_config;type:json" json:"source_config"`
 	ParticipantConfig JSON       `gorm:"column:participant_config;type:json" json:"participant_config"`

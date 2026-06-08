@@ -90,7 +90,7 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 
 		// Recompute from the FOR UPDATE re-read row so claim sees the latest config
 		// even when non-recurrence fields changed without bumping next_run_at.
-		nextRun, err := service.NextRunScheduledAdvance(lockedSched.CronExpr, lockedSched.IntervalDays, lockedSched.IntervalMonths, lockedSched.RunTime, lockedSched.DayOfWeek, lockedSched.DayOfMonth, *lockedSched.NextRunAt, now)
+		nextRun, err := service.NextRunScheduledAdvance(lockedSched.CronExpr, lockedSched.IntervalDays, lockedSched.IntervalMonths, lockedSched.RunTime, lockedSched.DayOfWeek, lockedSched.DayOfMonth, lockedSched.AnchorDOM, *lockedSched.NextRunAt, now)
 		if err != nil {
 			log.Printf("[scheduler] ALERT schedule %d has invalid recurrence (%v); disabling to stop repeated re-scan/cost", lockedSched.ID, err)
 			if err := tx.Model(&model.SummarySchedule{}).
@@ -100,7 +100,16 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 			}
 			return nil
 		}
-		start, end := service.ComputeTimeRange(lockedSched.TimeRangeType, now)
+		start, end, err := service.ComputeTimeRange(lockedSched.TimeRangeType, now, lockedSched.LastRunAt, lockedSched.CronExpr, lockedSched.IntervalDays, lockedSched.IntervalMonths)
+		if err != nil {
+			log.Printf("[scheduler] ALERT schedule %d has invalid time range (%v); disabling to stop repeated re-scan/cost", lockedSched.ID, err)
+			if err := tx.Model(&model.SummarySchedule{}).
+				Where("id = ?", lockedSched.ID).
+				Update("is_active", 0).Error; err != nil {
+				return err
+			}
+			return nil
+		}
 		if err := tx.Model(&model.SummarySchedule{}).
 			Where("id = ?", lockedSched.ID).
 			Updates(map[string]interface{}{
