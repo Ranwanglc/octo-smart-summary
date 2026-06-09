@@ -83,7 +83,7 @@ func main() {
 	go proc.Run()
 
 	// Start scheduler (cron jobs)
-	cronSched := worker.StartScheduler(summaryDB, cfg.WorkerMaxRetry, cfg.WorkerTriggerURL)
+	cronSched := worker.StartScheduler(summaryDB, cfg.WorkerMaxRetry, cfg.WorkerTriggerURL, cfg.ScheduleMaxWindowDays)
 
 	// Start internal HTTP server for worker-trigger
 	hub := ws.NewHub(summaryDB)

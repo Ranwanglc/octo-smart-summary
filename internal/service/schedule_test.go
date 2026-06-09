@@ -333,7 +333,7 @@ func TestComputeTimeRange_FixedWindows(t *testing.T) {
 		{3, now.Add(-30 * 24 * time.Hour)},
 	}
 	for _, c := range cases {
-		start, end, err := ComputeTimeRange(c.rangeType, now, nil, "", 1, 0)
+		start, end, err := ComputeTimeRange(c.rangeType, now, nil, "", 1, 0, 0)
 		if err != nil {
 			t.Fatalf("type %d: %v", c.rangeType, err)
 		}
@@ -347,7 +347,7 @@ func TestComputeTimeRange_SinceLastRun(t *testing.T) {
 	now := bj(2026, time.June, 10, 12, 0)
 	last := bj(2026, time.June, 8, 12, 0)
 	// With last_run set, the window starts there.
-	start, _, err := ComputeTimeRange(4, now, &last, "", 1, 0)
+	start, _, err := ComputeTimeRange(4, now, &last, "", 1, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,8 +355,38 @@ func TestComputeTimeRange_SinceLastRun(t *testing.T) {
 		t.Errorf("since-last with lastRun: got %v want %v", start, last)
 	}
 	// Without last_run, fall back one interval (1 day here).
-	start, _, _ = ComputeTimeRange(4, now, nil, "", 1, 0)
+	start, _, _ = ComputeTimeRange(4, now, nil, "", 1, 0, 0)
 	if want := now.Add(-24 * time.Hour); !start.Equal(want) {
 		t.Errorf("since-last no lastRun: got %v want %v", start, want)
+	}
+}
+
+// TestComputeTimeRange_Type4WindowCap verifies the pure-defense max-window clamp.
+func TestComputeTimeRange_Type4WindowCap(t *testing.T) {
+	now := bj(2026, time.June, 30, 12, 0)
+	// last_run far in the past (90 days) with a 30-day cap -> start clamped to now-30d.
+	farPast := now.Add(-90 * 24 * time.Hour)
+	start, _, err := ComputeTimeRange(4, now, &farPast, "", 1, 0, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := now.Add(-30 * 24 * time.Hour); !start.Equal(want) {
+		t.Errorf("over-cap window should clamp to now-30d: got %v want %v", start, want)
+	}
+	// last_run within the cap -> not clamped.
+	recent := now.Add(-5 * 24 * time.Hour)
+	start, _, _ = ComputeTimeRange(4, now, &recent, "", 1, 0, 30)
+	if !start.Equal(recent) {
+		t.Errorf("within-cap window must not be clamped: got %v want %v", start, recent)
+	}
+	// cap disabled (0) -> not clamped even when far past.
+	start, _, _ = ComputeTimeRange(4, now, &farPast, "", 1, 0, 0)
+	if !start.Equal(farPast) {
+		t.Errorf("cap=0 disables clamp: got %v want %v", start, farPast)
+	}
+	// fixed windows (type 1/2/3) are never affected by the cap.
+	start, _, _ = ComputeTimeRange(2, now, nil, "", 1, 0, 1)
+	if want := now.Add(-7 * 24 * time.Hour); !start.Equal(want) {
+		t.Errorf("type=2 must ignore cap: got %v want %v", start, want)
 	}
 }

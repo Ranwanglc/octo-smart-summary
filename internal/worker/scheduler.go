@@ -19,10 +19,10 @@ import (
 var schedulerHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
 // StartScheduler starts the 4 cron scan jobs (every 60s).
-func StartScheduler(db *gorm.DB, maxRetry int, workerTriggerURL string) *cron.Cron {
+func StartScheduler(db *gorm.DB, maxRetry int, workerTriggerURL string, maxWindowDays int) *cron.Cron {
 	c := cron.New()
 
-	c.AddFunc("@every 60s", func() { scanPendingSchedules(db) })
+	c.AddFunc("@every 60s", func() { scanPendingSchedules(db, maxWindowDays) })
 	c.AddFunc("@every 60s", func() { scanConfirmTimeouts(db) })
 	c.AddFunc("@every 60s", func() { scanStuckTasks(db, maxRetry) })
 	c.AddFunc("@every 60s", func() { scanStuckPersonalTasks(db, workerTriggerURL) })
@@ -33,7 +33,7 @@ func StartScheduler(db *gorm.DB, maxRetry int, workerTriggerURL string) *cron.Cr
 }
 
 // scanPendingSchedules requeues bound tasks from due schedules.
-func scanPendingSchedules(db *gorm.DB) {
+func scanPendingSchedules(db *gorm.DB, maxWindowDays int) {
 	now := timezone.Now()
 	var schedules []model.SummarySchedule
 	err := db.Where("is_active = 1 AND next_run_at <= ? AND deleted_at IS NULL", now).Find(&schedules).Error
@@ -43,7 +43,7 @@ func scanPendingSchedules(db *gorm.DB) {
 	}
 
 	for _, sched := range schedules {
-		taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now)
+		taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now, maxWindowDays)
 		if err != nil {
 			log.Printf("[scheduler] create task for schedule %d: %v", sched.ID, err)
 			continue
@@ -58,7 +58,7 @@ func scanPendingSchedules(db *gorm.DB) {
 	}
 }
 
-func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now time.Time) (int64, bool, error) {
+func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now time.Time, maxWindowDays int) (int64, bool, error) {
 	if sched.NextRunAt == nil {
 		return 0, false, nil
 	}
@@ -100,7 +100,7 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 			}
 			return nil
 		}
-		start, end, err := service.ComputeTimeRange(lockedSched.TimeRangeType, now, lockedSched.LastRunAt, lockedSched.CronExpr, lockedSched.IntervalDays, lockedSched.IntervalMonths)
+		start, end, err := service.ComputeTimeRange(lockedSched.TimeRangeType, now, lockedSched.LastRunAt, lockedSched.CronExpr, lockedSched.IntervalDays, lockedSched.IntervalMonths, maxWindowDays)
 		if err != nil {
 			log.Printf("[scheduler] ALERT schedule %d has invalid time range (%v); disabling to stop repeated re-scan/cost", lockedSched.ID, err)
 			if err := tx.Model(&model.SummarySchedule{}).
@@ -110,10 +110,15 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 			}
 			return nil
 		}
+		// Advance ONLY next_run_at here (the scheduling cadence) so a due schedule
+		// is not re-scanned every 60s. last_run_at (the type=4 incremental window
+		// anchor) must NOT advance at claim time: it is advanced later, only when we
+		// actually requeue the task to run (see below). Coupling them here was the
+		// bug -- a business skip would commit last_run_at=now without producing a
+		// summary, permanently dropping the skipped window for type=4.
 		if err := tx.Model(&model.SummarySchedule{}).
 			Where("id = ?", lockedSched.ID).
 			Updates(map[string]interface{}{
-				"last_run_at": now,
 				"next_run_at": nextRun,
 			}).Error; err != nil {
 			return err
@@ -125,23 +130,41 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 			Order("id DESC").
 			First(&task).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				log.Printf("[scheduler] ALERT schedule %d claimed but no bound task found; skipping overwrite", lockedSched.ID)
-				// Business skip: keep the advanced next_run_at (commit), no reset.
+				// Structurally broken (persistent): a schedule is created bound to a
+				// live task, so "no live bound task" means the task was deleted/unbound
+				// after creation. Such a schedule can never produce a summary and would
+				// otherwise re-scan + re-skip forever while freezing last_run_at (window
+				// grows unbounded). Disable it (same treatment as invalid recurrence)
+				// and alert. The FOR UPDATE re-read above already confirmed there is no
+				// live bound task within this locked tx, so this is not a rebind race.
+				log.Printf("[scheduler] ALERT schedule %d has no live bound task (deleted/unbound after creation); disabling + notifying creator", lockedSched.ID)
+				if err := tx.Model(&model.SummarySchedule{}).
+					Where("id = ?", lockedSched.ID).
+					Update("is_active", 0).Error; err != nil {
+					return err
+				}
+				// NOTE: creator notification is a follow-up. sendCallback lives on
+				// *Processor and is not reachable from this standalone scheduler
+				// function; wiring it cleanly is tracked separately. The ALERT log
+				// above records the disable + reason for now.
 				return nil
 			}
 			return err
 		}
 
 		if task.Status == model.StatusProcessing {
-			log.Printf("[scheduler] schedule %d task %d still processing; skipping overlapping overwrite", lockedSched.ID, task.ID)
-			// Business skip (overlap protection): commit advanced next_run_at.
+			// Transient: the previous run is still Processing. Skip WITHOUT advancing
+			// last_run_at -- the window is preserved and covered by the next cycle once
+			// the in-flight run finishes (stuck runs are recovered via the
+			// processing_deadline lease / scanStuckTasks).
+			log.Printf("[scheduler] schedule %d task %d still processing; skipping overlapping overwrite (last_run_at preserved)", lockedSched.ID, task.ID)
 			return nil
 		}
 
-		// Method A guard: scheduled summary is single-person only this version. Multi-person
-		// (team) tasks are driven by the human meta flow and must NOT be reset here. The claim
-		// already advanced next_run_at, so a multi-person row is simply skipped (and re-claimed
-		// + re-skipped next cycle) until team scheduling ships -- expected, not a bug.
+		// Scheduled summary is single-person only this version. A bound task that
+		// became multi-person after creation is structurally unsupported for
+		// scheduling and would re-scan + re-skip forever while freezing last_run_at.
+		// Disable + alert (same as the no-bound-task case).
 		var participantCount int64
 		if err := tx.Model(&model.SummaryParticipant{}).
 			Where("task_id = ?", task.ID).
@@ -149,8 +172,13 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 			return err
 		}
 		if participantCount > 1 {
-			log.Printf("[scheduler] schedule %d bound task %d is multi-person (%d participants); scheduled summary not supported for team tasks this version, skipping (next_run_at already advanced; expected re-skip next cycle)", lockedSched.ID, task.ID, participantCount)
-			// Business skip (multi-person guard): commit advanced next_run_at.
+			log.Printf("[scheduler] ALERT schedule %d bound task %d is multi-person (%d participants); scheduled summary not supported for team tasks, disabling + notifying creator", lockedSched.ID, task.ID, participantCount)
+			if err := tx.Model(&model.SummarySchedule{}).
+				Where("id = ?", lockedSched.ID).
+				Update("is_active", 0).Error; err != nil {
+				return err
+			}
+			// NOTE: creator notification is a follow-up (see no-bound-task note above).
 			return nil
 		}
 
@@ -199,6 +227,16 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 				"confirm_deadline":    nil,
 				"schedule_id":         lockedSched.ID,
 			}).Error; err != nil {
+			return err
+		}
+
+		// Advance last_run_at ONLY now that the task is actually requeued to run.
+		// This is the fix: the type=4 incremental window anchor moves only on a real
+		// run, never on a business skip, so a skipped interval's messages are still
+		// covered by the next window instead of being permanently dropped.
+		if err := tx.Model(&model.SummarySchedule{}).
+			Where("id = ?", lockedSched.ID).
+			Update("last_run_at", now).Error; err != nil {
 			return err
 		}
 

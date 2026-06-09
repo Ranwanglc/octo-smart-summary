@@ -453,7 +453,13 @@ func cadenceWindowStart(now time.Time, lastRunAt *time.Time, cronExpr string, in
 }
 
 // ComputeTimeRange returns (start, end) based on time_range_type.
-func ComputeTimeRange(rangeType int, now time.Time, lastRunAt *time.Time, cronExpr string, intervalDays int, intervalMonths int) (time.Time, time.Time, error) {
+//
+// maxWindowDays is a pure-defense cap for the type=4 (incremental) window: when
+// >0, the computed start is clamped to no earlier than now-maxWindowDays so a
+// frozen last_run_at (e.g. a long Processing overlap) cannot make a single run
+// try to summarize an unbounded span. <=0 disables the cap. The fixed windows
+// (type 1/2/3) are unaffected.
+func ComputeTimeRange(rangeType int, now time.Time, lastRunAt *time.Time, cronExpr string, intervalDays int, intervalMonths int, maxWindowDays int) (time.Time, time.Time, error) {
 	end := now
 	var start time.Time
 	switch rangeType {
@@ -468,6 +474,11 @@ func ComputeTimeRange(rangeType int, now time.Time, lastRunAt *time.Time, cronEx
 		start, err = cadenceWindowStart(now, lastRunAt, cronExpr, intervalDays, intervalMonths)
 		if err != nil {
 			return time.Time{}, time.Time{}, err
+		}
+		if maxWindowDays > 0 {
+			if floor := now.Add(-time.Duration(maxWindowDays) * 24 * time.Hour); start.Before(floor) {
+				start = floor
+			}
 		}
 	default:
 		return time.Time{}, time.Time{}, fmt.Errorf("unsupported time_range_type=%d", rangeType)

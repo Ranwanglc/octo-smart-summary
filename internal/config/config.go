@@ -52,6 +52,11 @@ type Config struct {
 	WorkerPollInterval   int
 	WorkerLeaseMinutes   int
 	WorkerMaxRetry       int
+	// ScheduleMaxWindowDays caps the start of a type=4 (incremental) summary
+	// window at now-ScheduleMaxWindowDays. Pure defense: a frozen last_run_at
+	// (e.g. a long Processing overlap) cannot blow up a single run's message
+	// volume. <=0 disables the cap.
+	ScheduleMaxWindowDays int
 	WorkerCallbackURL    string
 
 	// Message table count
@@ -107,6 +112,7 @@ func Load() *Config {
 		WorkerPollInterval:   envInt("WORKER_POLL_INTERVAL_SECONDS", 2),
 		WorkerLeaseMinutes:   envInt("WORKER_TASK_LEASE_MINUTES", 20),
 		WorkerMaxRetry:       envInt("WORKER_MAX_RETRY", 3),
+		ScheduleMaxWindowDays: envInt("SCHEDULE_MAX_WINDOW_DAYS", 30),
 		WorkerCallbackURL:    envStr("WORKER_API_CALLBACK_URL", ""),
 
 		MsgTableCount: envInt("MSG_TABLE_COUNT", 5),
