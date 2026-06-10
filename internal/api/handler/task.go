@@ -404,11 +404,16 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	orderClause := sortBy + " " + sortOrder
 
 	// Folding (1->N): scheduled tasks fold by schedule_id (only the latest run per
-	// schedule shows); manual tasks (schedule_id IS NULL) each form their own group
-	// via COALESCE(schedule_id, id) so every one stays visible. "Latest per group"
-	// uses id DESC (monotonic -> stable, unlike created_at which can tie at the same
-	// second). Pagination + total are computed AFTER folding (rn = 1).
-	innerSQL := "SELECT *, ROW_NUMBER() OVER (PARTITION BY COALESCE(schedule_id, id) ORDER BY id DESC) AS rn FROM summary_task WHERE " + whereSQL
+	// schedule shows); manual tasks (schedule_id IS NULL) each form their own group.
+	// The grouping key MUST namespace the two id spaces apart: summary_schedule.id and
+	// summary_task.id are independent auto-increment sequences with overlapping value
+	// ranges, so a bare COALESCE(schedule_id, id) collides a manual task id=N with a
+	// scheduled group schedule_id=N and wrongly folds them together (dropping rows).
+	// Prefix the key by type ('t' for manual task id, 's' for schedule id) to keep the
+	// namespaces fully separate. "Latest per group" uses id DESC (monotonic -> stable,
+	// unlike created_at which can tie at the same second). Pagination + total are
+	// computed AFTER folding (rn = 1).
+	innerSQL := "SELECT *, ROW_NUMBER() OVER (PARTITION BY (CASE WHEN schedule_id IS NULL THEN CONCAT('t', id) ELSE CONCAT('s', schedule_id) END) ORDER BY id DESC) AS rn FROM summary_task WHERE " + whereSQL
 
 	var total int64
 	countSQL := "SELECT COUNT(*) FROM (" + innerSQL + ") sub WHERE sub.rn = 1"
@@ -990,20 +995,13 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 				// The whole group (including liveTask) is now soft-deleted; done.
 				return nil
 			} else {
-				// Not the schedule creator: do not delete someone else's schedule or
-				// its other tasks. Unbind this one task and pause the schedule to avoid
-				// an active orphan, then soft-delete only this task below.
-				if err := tx.Model(&model.SummaryTask{}).
-					Where("id = ?", liveTask.ID).
-					Update("schedule_id", nil).Error; err != nil {
-					return err
-				}
-				if err := tx.Model(&model.SummarySchedule{}).
-					Where("id = ? AND deleted_at IS NULL", lockedSched.ID).
-					Update("is_active", 0).Error; err != nil {
-					return err
-				}
-				log.Printf("[task] DeleteSummary: task %d caller %s is not schedule %d creator; deleting only this task (unbind + pause schedule)", liveTask.ID, userID, lockedSched.ID)
+				// Not the schedule creator (a mere participant): forbid the delete
+				// entirely (Option A). Previously this branch unbound the task and
+				// paused (is_active=0) someone else's schedule, which let a participant
+				// silently disable the creator's scheduled summary -- a privilege
+				// escalation. Return 403 so the tx rolls back and nothing is touched.
+				log.Printf("[task] DeleteSummary: task %d caller %s is not schedule %d creator; denying (403)", liveTask.ID, userID, lockedSched.ID)
+				return service.NewBizError(40006, "仅创建者可删除该定时总结", http.StatusForbidden)
 			}
 		}
 
@@ -1012,6 +1010,11 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 			"deleted_at": now,
 		}).Error
 	}); err != nil {
+		var be *service.BizError
+		if errors.As(err, &be) {
+			bizErr(c, be)
+			return
+		}
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
 			return
