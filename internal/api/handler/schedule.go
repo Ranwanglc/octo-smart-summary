@@ -22,11 +22,21 @@ import (
 // ScheduleHandler handles schedule endpoints.
 type ScheduleHandler struct {
 	db *gorm.DB
+	// featureTeamSchedule, when true, bypasses the multi-person rejection guards
+	// (FEATURE_TEAM_SCHEDULE). Default false keeps the existing 40015 behavior.
+	featureTeamSchedule bool
 }
 
 // NewScheduleHandler creates a new ScheduleHandler.
 func NewScheduleHandler(db *gorm.DB) *ScheduleHandler {
 	return &ScheduleHandler{db: db}
+}
+
+// NewScheduleHandlerWithFlag creates a ScheduleHandler with the team-schedule
+// feature flag explicitly set. When featureTeamSchedule is true the multi-person
+// rejection guards are bypassed so multi-participant schedules can be created.
+func NewScheduleHandlerWithFlag(db *gorm.DB, featureTeamSchedule bool) *ScheduleHandler {
+	return &ScheduleHandler{db: db, featureTeamSchedule: featureTeamSchedule}
 }
 
 type createScheduleReq struct {
@@ -154,7 +164,11 @@ func storedParticipantConfigSubsetOfCreator(raw model.JSON, creatorID string) bo
 // validateEffectiveParticipantsSubsetOfCreator is the single post-load check that
 // the participant set actually taking effect (req if sent, else stored config)
 // is a subset of {creatorID}. creatorID must be the loaded task.CreatorID.
-func validateEffectiveParticipantsSubsetOfCreator(reqParticipants []participantReq, storedConfig model.JSON, creatorID string) error {
+func validateEffectiveParticipantsSubsetOfCreator(featureTeamSchedule bool, reqParticipants []participantReq, storedConfig model.JSON, creatorID string) error {
+	if featureTeamSchedule {
+		// Team schedules enabled: multi-person is allowed, skip the subset guard.
+		return nil
+	}
 	if reqParticipants != nil {
 		if !participantsSubsetOfCreator(reqParticipants, creatorID) {
 			return errMultiPersonNotSupported
@@ -413,7 +427,7 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 			}
 		}
 
-		task, err := loadTaskForTaskScope(tx, spaceID, userID, *req.TaskID)
+		task, err := loadTaskForTaskScope(tx, spaceID, userID, *req.TaskID, h.featureTeamSchedule)
 		if err != nil {
 			return err
 		}
@@ -424,7 +438,8 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		}
 
 		// Single-person guard: configured participants must be a subset of {creator}.
-		if !participantsSubsetOfCreator(req.Participants, task.CreatorID) {
+		// Bypassed when team schedules are enabled.
+		if !h.featureTeamSchedule && !participantsSubsetOfCreator(req.Participants, task.CreatorID) {
 			return errMultiPersonNotSupported
 		}
 
@@ -660,7 +675,8 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 	}
 	// Fail-closed multi-person guard on update; only when participants are sent
 	// (nil = leave untouched). Stored-config bind path is checked later in the tx.
-	if req.Participants != nil && !participantsSubsetOfCreator(req.Participants, userID) {
+	// Bypassed when team schedules are enabled.
+	if !h.featureTeamSchedule && req.Participants != nil && !participantsSubsetOfCreator(req.Participants, userID) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40015, Message: teamScheduleNotSupportedMsg})
 		return
 	}
@@ -861,7 +877,7 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		}
 
 		if req.Scope == "task" {
-			task, err = loadTaskForTaskScope(tx, spaceID, userID, *req.TaskID)
+			task, err = loadTaskForTaskScope(tx, spaceID, userID, *req.TaskID, h.featureTeamSchedule)
 			if err != nil {
 				return err
 			}
@@ -879,7 +895,7 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 			}
 
 			// Single post-load single-person guard against the loaded task's creator.
-			if err := validateEffectiveParticipantsSubsetOfCreator(req.Participants, lockedSched.ParticipantConfig, task.CreatorID); err != nil {
+			if err := validateEffectiveParticipantsSubsetOfCreator(h.featureTeamSchedule, req.Participants, lockedSched.ParticipantConfig, task.CreatorID); err != nil {
 				return err
 			}
 
@@ -1047,7 +1063,7 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 	})
 }
 
-func loadTaskForTaskScope(tx *gorm.DB, spaceID, userID string, taskID int64) (model.SummaryTask, error) {
+func loadTaskForTaskScope(tx *gorm.DB, spaceID, userID string, taskID int64, featureTeamSchedule bool) (model.SummaryTask, error) {
 	var task model.SummaryTask
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).
@@ -1062,12 +1078,15 @@ func loadTaskForTaskScope(tx *gorm.DB, spaceID, userID string, taskID int64) (mo
 	}
 	// Refuse binding a schedule to a multi-person task (same measure as the worker guard);
 	// otherwise the scheduler would skip it every cycle, leaving a silently dead timer.
-	participantCount, err := loadTaskParticipantCount(tx, task.ID)
-	if err != nil {
-		return model.SummaryTask{}, err
-	}
-	if participantCount > 1 {
-		return model.SummaryTask{}, errMultiPersonNotSupported
+	// When team schedules are enabled this guard is bypassed.
+	if !featureTeamSchedule {
+		participantCount, err := loadTaskParticipantCount(tx, task.ID)
+		if err != nil {
+			return model.SummaryTask{}, err
+		}
+		if participantCount > 1 {
+			return model.SummaryTask{}, errMultiPersonNotSupported
+		}
 	}
 	return task, nil
 }
@@ -1200,7 +1219,7 @@ func (h *ScheduleHandler) ToggleSchedule(c *gin.Context) {
 				if err != nil {
 					return err
 				}
-				if err := validateEffectiveParticipantsSubsetOfCreator(nil, lockedSched.ParticipantConfig, task.CreatorID); err != nil {
+				if err := validateEffectiveParticipantsSubsetOfCreator(h.featureTeamSchedule, nil, lockedSched.ParticipantConfig, task.CreatorID); err != nil {
 					return err
 				}
 				nextRun, err := service.NextRunInitial(

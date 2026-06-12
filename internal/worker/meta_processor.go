@@ -195,11 +195,17 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			return
 		}
 
-		// Bug3: the meta (team) flow is the human-driven multi-person link, which
-		// intentionally retains a full version history (re-submissions create new
-		// versions). Scheduled summary is single-person-only this version and never
-		// reaches the meta path, so pruning is always disabled here.
-		if err := saveLatestResultAndCompleteTask(m.proc.db, taskID, &result, false); err != nil {
+		// Bug3: scheduled multi-person tasks prune old auto versions in place (same as
+		// the single-person scheduled path); manual/human-driven multi-person runs retain
+		// full version history. Determine isScheduled from the task's trigger type.
+		var metaTask model.SummaryTask
+		isScheduled := false
+		if err := m.proc.db.Select("trigger_type").First(&metaTask, taskID).Error; err != nil {
+			log.Printf("[meta-worker] task %d trigger_type lookup failed (defaulting isScheduled=false): %v", taskID, err)
+		} else {
+			isScheduled = metaTask.TriggerType == model.TriggerScheduled
+		}
+		if err := saveLatestResultAndCompleteTask(m.proc.db, taskID, &result, isScheduled); err != nil {
 			if errors.Is(err, errTaskNoLongerProcessing) {
 				log.Printf("[meta-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
 				return

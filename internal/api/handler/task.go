@@ -550,6 +550,7 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		resultOut = gin.H{
 			"content":          latestResult.Content,
 			"citations":        latestResult.GetCitations(),
+			"team_citations":   latestResult.GetTeamCitations(),
 			"total_msg_count":  latestResult.TotalMsgCount,
 			"total_token_used": latestResult.TotalTokenUsed,
 			"model_version":    latestResult.ModelVersion,

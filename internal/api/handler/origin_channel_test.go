@@ -300,6 +300,86 @@ func TestGetSummary_IncludesOriginFields(t *testing.T) {
 	}
 }
 
+func TestGetSummary_IncludesTeamCitations(t *testing.T) {
+	db, imDB := setupOriginTestDB(t)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupOriginRouter(h)
+
+	now := time.Now().UTC()
+	task := model.SummaryTask{
+		TaskNo:            "GET-TC-001",
+		SpaceID:           "space1",
+		CreatorID:         "user1",
+		SummaryMode:       model.ModeByPerson,
+		Status:            model.StatusCompleted,
+		OriginChannelID:   "group_tc",
+		OriginChannelType: 1,
+		TimeRangeStart:    now.Add(-24 * time.Hour),
+		TimeRangeEnd:      now,
+	}
+	db.Create(&task)
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "user1", UserName: "U1"})
+
+	// A result carrying team citations ([Pn] -> participant) plus a plain
+	// citation. The detail (GetSummary) path must surface team_citations so the
+	// frontend can render [Pn] badges; without the handler change this assertion
+	// fails (team_citations key absent).
+	result := model.SummaryResult{
+		TaskID:      task.ID,
+		Content:     "team summary referencing [P1] and message [1]",
+		Version:     1,
+		GeneratedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	result.SetTeamCitations([]model.TeamCitation{
+		{Index: 1, UserID: "user1", UserName: "U1"},
+	})
+	db.Create(&result)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/summaries/%d", task.ID), nil)
+	req.Header.Set("Token", "user1")
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	data := resp["data"].(map[string]interface{})
+
+	resultOut, ok := data["result"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("result missing or wrong type: %v", data["result"])
+	}
+
+	tc, ok := resultOut["team_citations"].([]interface{})
+	if !ok {
+		t.Fatalf("team_citations missing or wrong type in result: %v", resultOut["team_citations"])
+	}
+	if len(tc) != 1 {
+		t.Fatalf("expected 1 team citation, got %d", len(tc))
+	}
+	first := tc[0].(map[string]interface{})
+	if int(first["index"].(float64)) != 1 {
+		t.Errorf("team citation index: want 1, got %v", first["index"])
+	}
+	if first["user_id"] != "user1" {
+		t.Errorf("team citation user_id: want user1, got %v", first["user_id"])
+	}
+	if first["user_name"] != "U1" {
+		t.Errorf("team citation user_name: want U1, got %v", first["user_name"])
+	}
+
+	// Plain citations key remains present and independent of team citations.
+	if _, ok := resultOut["citations"]; !ok {
+		t.Errorf("citations key should still be present alongside team_citations")
+	}
+}
+
 func TestGetTemplates_ReturnsCorrectStructure(t *testing.T) {
 	db, imDB := setupOriginTestDB(t)
 	h := NewTaskHandler(db, imDB, "")

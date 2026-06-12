@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var triggerClient = &http.Client{Timeout: 5 * time.Second}
@@ -71,6 +72,16 @@ func (h *PersonalHandler) Accept(c *gin.Context) {
 
 	now := timezone.Now()
 
+	// 🔴 Unique-key 500 fix: the AUTO scheduled dispatch path may pre-create a
+	// summary_personal_result row (uk_task_participant(task_id, participant_ref_id))
+	// while the participant itself is still Pending. The status-only idempotency
+	// guard above does not catch that case, so the old UNCONDITIONAL tx.Create(&pr)
+	// violated the unique key and returned 500 "Duplicate entry" -- the user saw
+	// their Accept fail / appear as a reject. Make the create idempotent: upsert with
+	// DoNothing on conflict, then read back the surviving row and reuse it. This is
+	// the same pattern bootstrapCreatorParticipant uses in the worker (zero DB/schema
+	// change, pure application-level idempotency).
+	var prCompleted bool
 	err := h.db.Transaction(func(tx *gorm.DB) error {
 		// Update participant to accepted
 		if err := tx.Model(&participant).Updates(map[string]interface{}{
@@ -80,7 +91,8 @@ func (h *PersonalHandler) Accept(c *gin.Context) {
 			return err
 		}
 
-		// Create personal result
+		// Idempotent create of the personal result. On conflict with an existing
+		// (task_id, participant_ref_id) row, do nothing and reuse the existing row.
 		pr := model.PersonalResult{
 			TaskID:           taskID,
 			ParticipantRefID: participant.ID,
@@ -90,8 +102,33 @@ func (h *PersonalHandler) Accept(c *gin.Context) {
 			CreatedAt:        now,
 			UpdatedAt:        now,
 		}
-		if err := tx.Create(&pr).Error; err != nil {
-			return err
+		result := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "task_id"}, {Name: "participant_ref_id"}},
+			DoNothing: true,
+		}).Create(&pr)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			// A personal_result already exists (e.g. pre-created by AUTO dispatch).
+			// Reuse it instead of inserting a duplicate.
+			if err := tx.Where("task_id = ? AND participant_ref_id = ?", taskID, participant.ID).
+				First(&pr).Error; err != nil {
+				return err
+			}
+			// If the existing row is in a terminal state (Completed/Submitted), don't
+			// reset it -- accept stays idempotent and the worker is not re-triggered
+			// over a finished result. Otherwise make sure worker_status is Pending so
+			// scheduledAutoDispatchTargets (Accepted && worker_status==Pending) can pick
+			// it up for (re)dispatch.
+			if pr.WorkerStatus == model.PersonalStatusCompleted || pr.SubmittedAt != nil {
+				prCompleted = true
+			} else if pr.WorkerStatus != model.PersonalStatusPending {
+				if err := tx.Model(&model.PersonalResult{}).Where("id = ?", pr.ID).
+					Update("worker_status", model.PersonalStatusPending).Error; err != nil {
+					return err
+				}
+			}
 		}
 
 		// Link personal_result_id back to participant
@@ -103,12 +140,15 @@ func (h *PersonalHandler) Accept(c *gin.Context) {
 		return
 	}
 
-	// Trigger personal summary worker (async, non-blocking)
-	go h.triggerWorker(model.WorkerTriggerRequest{
-		Type:             "personal_summary",
-		TaskID:           taskID,
-		ParticipantRefID: participant.ID,
-	})
+	// Trigger personal summary worker (async, non-blocking). Skip when the existing
+	// result is already terminal so we never overwrite a finished/submitted summary.
+	if !prCompleted {
+		go h.triggerWorker(model.WorkerTriggerRequest{
+			Type:             "personal_summary",
+			TaskID:           taskID,
+			ParticipantRefID: participant.ID,
+		})
+	}
 
 	ok(c, gin.H{"status": "accepted"})
 }
@@ -219,14 +259,39 @@ func (h *PersonalHandler) Submit(c *gin.Context) {
 		return
 	}
 
-	// Idempotent: already submitted
+	// Idempotent fast-path: already submitted (avoids a needless write). The
+	// authoritative idempotency guard is the conditional UPDATE below; this is just
+	// an early exit for the common case.
 	if pr.SubmittedAt != nil {
 		ok(c, gin.H{"status": "submitted"})
 		return
 	}
 
 	now := timezone.Now()
-	h.db.Model(&pr).Update("submitted_at", now)
+	// 🔴 Blocker-2 fix: concurrency-safe submit. The old code did read-then-check
+	// (pr.SubmittedAt==nil) then an UNCONDITIONAL Updates -- racing the system
+	// back-fill (backfillScheduledSubmittedAt, submit_source=2) it could overwrite a
+	// system-written row, flipping submit_source back to 1 with no CAS/transaction.
+	// Use a conditional UPDATE ... WHERE submitted_at IS NULL so exactly one writer
+	// (manual OR system) ever sets submitted_at; the loser sees RowsAffected==0 and
+	// returns the idempotent "already submitted" response WITHOUT rewriting source.
+	res := h.db.Model(&model.PersonalResult{}).
+		Where("id = ? AND submitted_at IS NULL", pr.ID).
+		Updates(map[string]interface{}{
+			"submitted_at":  now,
+			"submit_source": model.SubmitSourceManual,
+		})
+	if res.Error != nil {
+		log.Printf("[personal] submit conditional update error: %v", res.Error)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: res.Error.Error()})
+		return
+	}
+	if res.RowsAffected == 0 {
+		// Already submitted by a concurrent manual /submit or the system back-fill.
+		// Do NOT rewrite submit_source; return the same idempotent "submitted" semantics.
+		ok(c, gin.H{"status": "submitted"})
+		return
+	}
 
 	// Update participant status to submitted
 	h.db.Model(&model.SummaryParticipant{}).

@@ -11,7 +11,7 @@ import (
 )
 
 // SetupPublic configures the public API router on :8080.
-func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string, candidateQueryLimit int) *gin.Engine {
+func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
@@ -37,7 +37,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 
 	// API routes
 	taskH := handler.NewTaskHandler(db, imDB, workerTriggerURL)
-	schedH := handler.NewScheduleHandler(db)
+	schedH := handler.NewScheduleHandlerWithFlag(db, featureTeamSchedule)
 	personalH := handler.NewPersonalHandler(db, workerTriggerURL, hub)
 	editH := handler.NewEditHandler(db)
 

@@ -45,7 +45,7 @@ func buildScheduledTaskChildren(tx *gorm.DB, imDB *gorm.DB, sched model.SummaryS
 	if err := buildScheduledTaskSources(tx, imDB, task.ID, sched.SourceConfig); err != nil {
 		return err
 	}
-	if err := buildScheduledTaskParticipants(tx, task, sched.ParticipantConfig, now); err != nil {
+	if err := buildScheduledTaskParticipants(tx, task, sched.ParticipantConfig, sched.ConfirmPolicy, now); err != nil {
 		return err
 	}
 	return nil
@@ -79,13 +79,39 @@ func buildScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw mod
 	return nil
 }
 
-func buildScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw model.JSON, now time.Time) error {
+// buildScheduledTaskParticipants materializes the participant + personal_result
+// rows for a freshly INSERTed scheduled task. The initial participant status is
+// driven by the schedule's confirm_policy so the two run modes stay consistent:
+//
+//   - AUTO (confirm_policy==SchedConfirmAuto): every participant (creator AND
+//     configured others) is pre-Accepted with ConfirmedAt set. There is no human
+//     confirmation step, so the AUTO dispatch path (scheduledAutoDispatchTargets,
+//     which selects status==Accepted && worker_status==Pending) can pick up the
+//     whole roster and actually run it. This was the real bug: a non-AUTO-aware
+//     build that left non-creator participants in a non-Accepted state silently
+//     made AUTO dispatch select nobody, so a scheduled multi-person AUTO run never
+//     produced any personal_result.
+//   - CONFIRM (confirm_policy==SchedConfirmRequire, and any other non-AUTO policy
+//     this version): only the creator is pre-Accepted; configured others start
+//     ParticipantPending and must individually Accept via the API before they run.
+//     AUTO dispatch deliberately does NOT pick them up (it is gated to AUTO only),
+//     preserving the human-confirmation semantics.
+//
+// The creator is ALWAYS Accepted regardless of policy (the creator implicitly
+// confirms by owning the schedule), matching bootstrapCreatorParticipant and the
+// manual-task creator-direct-start behavior.
+func buildScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw model.JSON, confirmPolicy int, now time.Time) error {
 	var participants []scheduleParticipantConfig
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &participants); err != nil {
 			return service.NewBizError(40000, "定时参与者配置无效", http.StatusBadRequest)
 		}
 	}
+
+	// AUTO pre-accepts the whole roster; non-AUTO (CONFIRM) leaves non-creator
+	// participants Pending for human confirmation. Default-to-CONFIRM on any
+	// unknown policy is the safe side (don't auto-run un-confirmed people).
+	autoAccept := confirmPolicy == model.SchedConfirmAuto
 
 	desired := make([]scheduleParticipantConfig, 0, len(participants)+1)
 	seen := make(map[string]struct{}, len(participants)+1)
@@ -112,12 +138,22 @@ func buildScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw mod
 	}
 
 	for _, participant := range desired {
+		// Creator is always Accepted; others follow confirm_policy.
+		isCreator := participant.UserID == task.CreatorID
+		status := model.ParticipantAccepted
+		var confirmedAt *time.Time = &now
+		if !isCreator && !autoAccept {
+			// CONFIRM policy, non-creator: stays Pending until the participant
+			// Accepts via the API. No ConfirmedAt yet.
+			status = model.ParticipantPending
+			confirmedAt = nil
+		}
 		row := model.SummaryParticipant{
 			TaskID:      task.ID,
 			UserID:      participant.UserID,
 			UserName:    participant.UserName,
-			Status:      model.ParticipantAccepted,
-			ConfirmedAt: &now,
+			Status:      status,
+			ConfirmedAt: confirmedAt,
 		}
 		if err := tx.Create(&row).Error; err != nil {
 			return err

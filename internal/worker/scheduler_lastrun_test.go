@@ -49,6 +49,32 @@ func seedDueSchedule(t *testing.T, db *gorm.DB, lastRunAt *time.Time) model.Summ
 	return sched
 }
 
+// seedDueScheduleWithPolicy is seedDueSchedule with an explicit confirm_policy and
+// participant_config, so the claim/requeue path can be exercised under AUTO vs
+// CONFIRM. participantUserIDs are the NON-creator configured users (the creator u1
+// is always implicitly materialized by buildScheduledTaskParticipants).
+func seedDueScheduleWithPolicy(t *testing.T, db *gorm.DB, lastRunAt *time.Time, confirmPolicy int, participantUserIDs ...string) model.SummarySchedule {
+	t.Helper()
+	sched := seedDueSchedule(t, db, lastRunAt)
+	updates := map[string]interface{}{"confirm_policy": confirmPolicy}
+	if len(participantUserIDs) > 0 {
+		cfg := "["
+		for i, uid := range participantUserIDs {
+			if i > 0 {
+				cfg += ","
+			}
+			cfg += `{"user_id":"` + uid + `"}`
+		}
+		cfg += "]"
+		updates["participant_config"] = model.JSON(cfg)
+	}
+	if err := db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).
+		Updates(updates).Error; err != nil {
+		t.Fatalf("set confirm_policy/participant_config: %v", err)
+	}
+	return reloadSchedule(t, db, sched.ID)
+}
+
 func seedBoundTask(t *testing.T, db *gorm.DB, scheduleID int64, status int, participants int) model.SummaryTask {
 	t.Helper()
 	now := time.Now().UTC()
@@ -91,7 +117,7 @@ func TestClaim_RequeueAdvancesLastRunAt(t *testing.T) {
 	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
 
 	now := time.Now().UTC()
-	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30)
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, false)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -115,7 +141,7 @@ func TestClaim_OverlapSkipPreservesLastRunAt(t *testing.T) {
 	seedBoundTask(t, db, sched.ID, model.StatusProcessing, 1)
 
 	now := time.Now().UTC()
-	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30)
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, false)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -147,7 +173,7 @@ func TestClaim_NoPriorTaskCreatesFirstTask(t *testing.T) {
 	// no prior task seeded
 
 	now := time.Now().UTC()
-	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30)
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, false)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -187,7 +213,7 @@ func TestClaim_MultiPersonConfigDisablesSchedule(t *testing.T) {
 	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
 
 	now := time.Now().UTC()
-	_, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30)
+	_, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, false)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -200,5 +226,209 @@ func TestClaim_MultiPersonConfigDisablesSchedule(t *testing.T) {
 	}
 	if got.LastRunAt == nil || !got.LastRunAt.Equal(old) {
 		t.Errorf("last_run_at must be preserved (no run produced), got %v want %v", got.LastRunAt, old)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FEATURE_TEAM_SCHEDULE flag at claim time (merged from team_schedule_p0_test.go).
+// ---------------------------------------------------------------------------
+
+// With FEATURE_TEAM_SCHEDULE on, a multi-person schedule must NOT be disabled at
+// claim time; it must produce a brand-new task whose subtables include every
+// configured participant (all Accepted under AUTO policy=0) plus the creator.
+func TestClaim_MultiPersonConfig_FlagOn_RunsMultiPerson(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	sched := seedDueSchedule(t, db, &old)
+
+	// creator u1 + u2 + u3 in participant_config -> 3 distinct users.
+	sched.ParticipantConfig = model.JSON(`[{"user_id":"u2"},{"user_id":"u3"}]`)
+	if err := db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).
+		Update("participant_config", sched.ParticipantConfig).Error; err != nil {
+		t.Fatalf("set participant_config: %v", err)
+	}
+
+	now := time.Now().UTC()
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, true /* featureTeamSchedule */)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed || taskID == 0 {
+		t.Fatalf("flag-on multi-person should create a task, got claimed=%v taskID=%d", claimed, taskID)
+	}
+
+	got := reloadSchedule(t, db, sched.ID)
+	if got.IsActive != 1 {
+		t.Errorf("flag-on multi-person must keep schedule active, got is_active=%d", got.IsActive)
+	}
+
+	// Subtables: 3 distinct participants (u1 creator + u2 + u3), all Accepted, each
+	// with a Pending personal_result.
+	var pCount, prCount, acceptedCount int64
+	db.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Count(&pCount)
+	db.Model(&model.PersonalResult{}).Where("task_id = ?", taskID).Count(&prCount)
+	db.Model(&model.SummaryParticipant{}).
+		Where("task_id = ? AND status = ?", taskID, model.ParticipantAccepted).Count(&acceptedCount)
+	if pCount != 3 || prCount != 3 {
+		t.Errorf("multi-person subtables: participants=%d personal_results=%d, want 3/3", pCount, prCount)
+	}
+	if acceptedCount != 3 {
+		t.Errorf("AUTO policy: all participants must be Accepted, got accepted=%d/3", acceptedCount)
+	}
+
+	// The created task must be a scheduled task.
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil {
+		t.Fatalf("load task: %v", err)
+	}
+	if task.TriggerType != model.TriggerScheduled {
+		t.Errorf("new task trigger_type=%d, want TriggerScheduled", task.TriggerType)
+	}
+}
+
+// 🔴 REAL-BUG REGRESSION (scope=task AUTO requeue path): a scheduled multi-person
+// AUTO schedule that already has a prior bound task (the requeue path, NOT the
+// first-run path) must, after claim, build EVERY participant as Accepted with a
+// Pending personal_result, and the AUTO dispatch selector must then pick up the
+// WHOLE roster. The e2e bug was that the claim/requeue path left participants in a
+// non-Accepted state so scheduledAutoDispatchTargets selected nobody -> the run
+// produced no personal_result. This test exercises the genuine
+// claimAndCreateScheduledTask -> buildScheduledTaskChildren ->
+// buildScheduledTaskParticipants -> scheduledAutoDispatchTargets chain end-to-end
+// (no hand-seeded Accepted participants).
+func TestClaim_AutoRequeue_AllParticipantsAccepted_DispatchSelectsAll(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	// AUTO (confirm_policy=0) + creator u1 + u2 + u3 configured.
+	sched := seedDueScheduleWithPolicy(t, db, &old, model.SchedConfirmAuto, "u2", "u3")
+	// Prior terminal bound task under the schedule => this is the REQUEUE path
+	// (latest exists, terminal so no overlap skip), distinct from first-run.
+	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+
+	now := time.Now().UTC()
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, true /* featureTeamSchedule */)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed || taskID == 0 {
+		t.Fatalf("AUTO requeue should create a task, got claimed=%v taskID=%d", claimed, taskID)
+	}
+
+	// New task must be a scheduled task (trigger_type=2).
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil {
+		t.Fatalf("load task: %v", err)
+	}
+	if task.TriggerType != model.TriggerScheduled {
+		t.Errorf("requeued task trigger_type=%d, want TriggerScheduled(2)", task.TriggerType)
+	}
+
+	// All 3 participants Accepted, all 3 personal_result Pending.
+	var total, accepted, prPending int64
+	db.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Count(&total)
+	db.Model(&model.SummaryParticipant{}).
+		Where("task_id = ? AND status = ?", taskID, model.ParticipantAccepted).Count(&accepted)
+	db.Model(&model.PersonalResult{}).
+		Where("task_id = ? AND worker_status = ?", taskID, model.PersonalStatusPending).Count(&prPending)
+	if total != 3 {
+		t.Fatalf("want 3 participants, got %d", total)
+	}
+	if accepted != 3 {
+		t.Errorf("AUTO requeue: all participants must be Accepted, got accepted=%d/3", accepted)
+	}
+	if prPending != 3 {
+		t.Errorf("AUTO requeue: all personal_result must be Pending, got pending=%d/3", prPending)
+	}
+
+	// The whole point: AUTO dispatch must now select EVERY participant.
+	targets, err := scheduledAutoDispatchTargets(db, taskID)
+	if err != nil {
+		t.Fatalf("dispatch targets: %v", err)
+	}
+	if len(targets) != 3 {
+		t.Errorf("AUTO requeue dispatch must select all 3 participants, got %d: %v", len(targets), targets)
+	}
+}
+
+// CONFIRM (confirm_policy=1) requeue path: only the creator is pre-Accepted; the
+// other configured participants must stay Pending awaiting human Accept, and AUTO
+// dispatch must NOT pick them up (it selects only the creator). This guards the
+// fix from over-reaching (it must NOT blindly Accept everyone under CONFIRM).
+func TestClaim_ConfirmRequeue_OnlyCreatorAccepted_DispatchSelectsCreatorOnly(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	// CONFIRM (confirm_policy=1) + creator u1 + u2 + u3 configured.
+	sched := seedDueScheduleWithPolicy(t, db, &old, model.SchedConfirmRequire, "u2", "u3")
+	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+
+	now := time.Now().UTC()
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, true /* featureTeamSchedule */)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed || taskID == 0 {
+		t.Fatalf("CONFIRM requeue should still create a task, got claimed=%v taskID=%d", claimed, taskID)
+	}
+
+	var total, accepted, pending int64
+	db.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Count(&total)
+	db.Model(&model.SummaryParticipant{}).
+		Where("task_id = ? AND status = ?", taskID, model.ParticipantAccepted).Count(&accepted)
+	db.Model(&model.SummaryParticipant{}).
+		Where("task_id = ? AND status = ?", taskID, model.ParticipantPending).Count(&pending)
+	if total != 3 {
+		t.Fatalf("want 3 participants, got %d", total)
+	}
+	if accepted != 1 {
+		t.Errorf("CONFIRM requeue: only creator must be Accepted, got accepted=%d (want 1)", accepted)
+	}
+	if pending != 2 {
+		t.Errorf("CONFIRM requeue: non-creator participants must be Pending, got pending=%d (want 2)", pending)
+	}
+
+	// The creator participant must be u1 and Accepted.
+	var creator model.SummaryParticipant
+	if err := db.Where("task_id = ? AND user_id = ?", taskID, "u1").First(&creator).Error; err != nil {
+		t.Fatalf("load creator participant: %v", err)
+	}
+	if creator.Status != model.ParticipantAccepted {
+		t.Errorf("creator must be Accepted under CONFIRM, got status=%d", creator.Status)
+	}
+
+	// AUTO dispatch (gated to AUTO) must select only the creator under CONFIRM:
+	// scheduledAutoDispatchTargets keys off ParticipantAccepted, so it returns just
+	// the one Accepted creator -- the non-creator Pending participants are NOT run
+	// until they confirm via the API.
+	targets, err := scheduledAutoDispatchTargets(db, taskID)
+	if err != nil {
+		t.Fatalf("dispatch targets: %v", err)
+	}
+	if len(targets) != 1 {
+		t.Errorf("CONFIRM requeue: dispatch selector must pick only the Accepted creator, got %d: %v", len(targets), targets)
+	}
+}
+
+// With FEATURE_TEAM_SCHEDULE off the legacy guard still disables a multi-person
+// schedule (kept as a regression guard alongside TestClaim_MultiPersonConfigDisablesSchedule).
+func TestClaim_MultiPersonConfig_FlagOff_StillDisables(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	sched := seedDueSchedule(t, db, &old)
+	sched.ParticipantConfig = model.JSON(`[{"user_id":"u2"}]`)
+	if err := db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).
+		Update("participant_config", sched.ParticipantConfig).Error; err != nil {
+		t.Fatalf("set participant_config: %v", err)
+	}
+
+	now := time.Now().UTC()
+	_, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, false /* flag off */)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed {
+		t.Fatalf("expected claimed=true")
+	}
+	if got := reloadSchedule(t, db, sched.ID); got.IsActive != 0 {
+		t.Errorf("flag-off multi-person must disable schedule, got is_active=%d", got.IsActive)
 	}
 }

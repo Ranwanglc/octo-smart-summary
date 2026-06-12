@@ -19,10 +19,12 @@ import (
 var schedulerHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
 // StartScheduler starts the 4 cron scan jobs (every 60s).
-func StartScheduler(db *gorm.DB, imDB *gorm.DB, maxRetry int, workerTriggerURL string, maxWindowDays int) *cron.Cron {
+// featureTeamSchedule, when true, lets multi-person schedules through the claim path
+// instead of disabling them (FEATURE_TEAM_SCHEDULE).
+func StartScheduler(db *gorm.DB, imDB *gorm.DB, maxRetry int, workerTriggerURL string, maxWindowDays int, featureTeamSchedule bool) *cron.Cron {
 	c := cron.New()
 
-	c.AddFunc("@every 60s", func() { scanPendingSchedules(db, imDB, maxWindowDays) })
+	c.AddFunc("@every 60s", func() { scanPendingSchedules(db, imDB, maxWindowDays, featureTeamSchedule) })
 	c.AddFunc("@every 60s", func() { scanConfirmTimeouts(db) })
 	c.AddFunc("@every 60s", func() { scanStuckTasks(db, maxRetry) })
 	c.AddFunc("@every 60s", func() { scanStuckPersonalTasks(db, workerTriggerURL) })
@@ -33,7 +35,7 @@ func StartScheduler(db *gorm.DB, imDB *gorm.DB, maxRetry int, workerTriggerURL s
 }
 
 // scanPendingSchedules requeues bound tasks from due schedules.
-func scanPendingSchedules(db *gorm.DB, imDB *gorm.DB, maxWindowDays int) {
+func scanPendingSchedules(db *gorm.DB, imDB *gorm.DB, maxWindowDays int, featureTeamSchedule bool) {
 	now := timezone.Now()
 	var schedules []model.SummarySchedule
 	err := db.Where("is_active = 1 AND next_run_at <= ? AND deleted_at IS NULL", now).Find(&schedules).Error
@@ -43,7 +45,7 @@ func scanPendingSchedules(db *gorm.DB, imDB *gorm.DB, maxWindowDays int) {
 	}
 
 	for _, sched := range schedules {
-		taskID, claimed, err := claimAndCreateScheduledTask(db, imDB, sched, now, maxWindowDays)
+		taskID, claimed, err := claimAndCreateScheduledTask(db, imDB, sched, now, maxWindowDays, featureTeamSchedule)
 		if err != nil {
 			log.Printf("[scheduler] create task for schedule %d: %v", sched.ID, err)
 			continue
@@ -58,7 +60,7 @@ func scanPendingSchedules(db *gorm.DB, imDB *gorm.DB, maxWindowDays int) {
 	}
 }
 
-func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.SummarySchedule, now time.Time, maxWindowDays int) (int64, bool, error) {
+func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.SummarySchedule, now time.Time, maxWindowDays int, featureTeamSchedule bool) (int64, bool, error) {
 	if sched.NextRunAt == nil {
 		return 0, false, nil
 	}
@@ -168,15 +170,16 @@ func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summary
 			return nil
 		}
 
-		// Scheduled summary is single-person only this version. If the schedule's
-		// participant config went multi-person it is structurally unsupported for
-		// scheduling. Guard against the schedule config (not a bound task, since under
-		// 1->N each run is fresh). >1 distinct configured users (excluding the implicit
-		// creator dedup) => disable + alert.
+		// Scheduled summary is single-person only unless FEATURE_TEAM_SCHEDULE is on.
+		// If the schedule's participant config went multi-person and the flag is OFF, it
+		// is structurally unsupported for scheduling: disable + alert. When the flag is
+		// ON, multi-person schedules are allowed through to the multi-person execution
+		// path (children built by buildScheduledTaskChildren, all participants Accepted
+		// under AUTO; meta aggregation via the submit-gate back-fill).
 		if multiPerson, err := scheduleConfigMultiPerson(lockedSched); err != nil {
 			return err
-		} else if multiPerson {
-			log.Printf("[scheduler] ALERT schedule %d participant config is multi-person; scheduled summary not supported for team tasks, disabling + notifying creator", lockedSched.ID)
+		} else if multiPerson && !featureTeamSchedule {
+			log.Printf("[scheduler] ALERT schedule %d participant config is multi-person; scheduled summary not supported for team tasks (FEATURE_TEAM_SCHEDULE off), disabling + notifying creator", lockedSched.ID)
 			if err := tx.Model(&model.SummarySchedule{}).
 				Where("id = ?", lockedSched.ID).
 				Update("is_active", 0).Error; err != nil {
@@ -191,18 +194,18 @@ func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summary
 		// INSERT a brand-new task for this run (1->N). Title/origin/space carry over
 		// from the schedule; the rest is a fresh Pending scheduled task.
 		newTask = model.SummaryTask{
-			TaskNo:          service.GenerateTaskNo(),
-			SpaceID:         lockedSched.SpaceID,
-			CreatorID:       lockedSched.CreatorID,
-			Title:           lockedSched.Title,
-			SummaryMode:     lockedSched.SummaryMode,
-			TimeRangeStart:  start,
-			TimeRangeEnd:    end,
-			Status:          model.StatusPending,
-			TriggerType:     model.TriggerScheduled,
-			ScheduleID:      &lockedSched.ID,
-			CreatedAt:       now,
-			UpdatedAt:       now,
+			TaskNo:         service.GenerateTaskNo(),
+			SpaceID:        lockedSched.SpaceID,
+			CreatorID:      lockedSched.CreatorID,
+			Title:          lockedSched.Title,
+			SummaryMode:    lockedSched.SummaryMode,
+			TimeRangeStart: start,
+			TimeRangeEnd:   end,
+			Status:         model.StatusPending,
+			TriggerType:    model.TriggerScheduled,
+			ScheduleID:     &lockedSched.ID,
+			CreatedAt:      now,
+			UpdatedAt:      now,
 		}
 		if hasLatest {
 			// Preserve origin channel from the previous run so the new summary keeps
