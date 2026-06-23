@@ -584,7 +584,10 @@ func TestGetSummary_ByPersonHidesPlainCitations(t *testing.T) {
 }
 
 // TestGetResult_ByPersonHidesPlainCitations (B2) — same privacy guarantee on the
-// GetResult endpoint, which also returned GetCitations() unconditionally.
+// GetResult endpoint. Updated for P1-A: stripping is now gated on TRUE
+// multi-person (participantCount>1), not on SummaryMode==ModeByPerson (which
+// fired for single-person tasks too and wrongly wiped their own [n] sources).
+// This task therefore seeds TWO participants so the privacy strip still applies.
 func TestGetResult_ByPersonHidesPlainCitations(t *testing.T) {
 	db, imDB := setupOriginTestDB(t)
 	h := NewTaskHandler(db, imDB, "")
@@ -602,6 +605,7 @@ func TestGetResult_ByPersonHidesPlainCitations(t *testing.T) {
 	}
 	db.Create(&task)
 	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "C1"})
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "participant2", UserName: "P2"})
 
 	result := model.SummaryResult{
 		TaskID:      task.ID,

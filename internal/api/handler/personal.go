@@ -711,6 +711,14 @@ func (h *PersonalHandler) AddMembers(c *gin.Context) {
 		c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "仅创建者可添加成员"})
 		return
 	}
+	// Reject terminal tasks: new members would be stuck Pending forever (no revive
+	// path — Accept revive CAS is WHERE status=Completed, worker CAS also misses).
+	// Only Failed/Cancelled are blocked; Pending/WaitingConfirm/Processing/Completed
+	// still allow adding (Completed is this PR's revive-recompute scenario).
+	if task.Status == model.StatusFailed || task.Status == model.StatusCancelled {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "任务已结束，无法添加成员"})
+		return
+	}
 
 	// Dedup + drop blanks from the request roster.
 	seen := make(map[string]struct{}, len(req.UserIDs))

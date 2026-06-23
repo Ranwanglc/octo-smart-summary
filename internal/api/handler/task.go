@@ -595,12 +595,14 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 
 	var resultOut interface{}
 	if hasResult {
-		// B2 (privacy): for BY_PERSON tasks the team summary's plain citations
-		// contain other members' raw chat messages. Do not ship them to any
-		// participant. team_citations ([Pn], point at people) are kept.
-		// BY_GROUP keeps the original behaviour.
+		// B2 (privacy): only a TRUE multi-person BY_PERSON team summary has plain
+		// citations that contain OTHER members' raw chat messages, so those must not
+		// be shipped to any participant. A single-person task's plain citations only
+		// reference the caller's own messages -> keep them so [n] source links work.
+		// Multi-person judged by participantCount>1 (same rule as edit.go:107 etc).
+		// participants is already loaded above (task.go:579); do NOT re-query.
 		plainCitations := latestResult.GetCitations()
-		if task.SummaryMode == model.ModeByPerson {
+		if len(participants) > 1 {
 			plainCitations = []model.Citation{}
 		}
 		resultOut = gin.H{
@@ -767,7 +769,7 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 		return
 	}
 
-	task, authorized := h.authorizeTaskAccess(c, taskID)
+	_, authorized := h.authorizeTaskAccess(c, taskID)
 	if !authorized {
 		return
 	}
@@ -779,10 +781,18 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 		return
 	}
 
-	// B2 (privacy): BY_PERSON team result must not leak other members' raw
-	// chat citations. Keep BY_GROUP unchanged.
+	// B2 (privacy): only a TRUE multi-person team result leaks OTHER members' raw
+	// chat citations; a single-person task's plain citations reference only the
+	// caller's own messages -> keep them so [n] source links work. Multi-person is
+	// participantCount>1 (same rule as edit.go:107 etc). No participant list is in
+	// scope here, so query the count once via loadTaskParticipantCount.
 	plainCitations := result.GetCitations()
-	if task != nil && task.SummaryMode == model.ModeByPerson {
+	pc, err := loadTaskParticipantCount(h.db, taskID)
+	if err != nil {
+		// Conservative fail-closed (privacy over feature): on count error, strip.
+		log.Printf("[task] GetResult participant count error task=%d: %v", taskID, err)
+		plainCitations = []model.Citation{}
+	} else if pc > 1 {
 		plainCitations = []model.Citation{}
 	}
 

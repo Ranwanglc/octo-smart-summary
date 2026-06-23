@@ -10,6 +10,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -521,4 +522,165 @@ func TestGetSummary_PermissionsSinglePersonCreator(t *testing.T) {
 	assertPerm(t, perms, "can_view_schedule", true)  // creator is also the participant
 	assertPerm(t, perms, "can_edit_personal", true)  // creator is also the participant
 	assertPerm(t, perms, "can_edit", true)           // legacy: single-person creator completed
+}
+
+// --- P1-A: plain-citation stripping must be gated on TRUE multi-person
+//     (participantCount>1), not on SummaryMode==ModeByPerson. ---
+//
+// Background: the codebase's single "multi-person" measure is participantCount>1
+// (Count(task_id=?)>1; see edit.go:107 / personal.go:226,548 / schedule.go:1503),
+// and EVERY task is ModeByPerson (there is no ModeByGroup in this DB). The old
+// GetSummary/GetResult code stripped plain citations whenever
+// task.SummaryMode==model.ModeByPerson, which therefore wiped the [n] source
+// citations of 100% of summaries -- including SINGLE-person ones whose plain
+// citations only reference the caller's OWN messages (no cross-member privacy
+// concern). The fix strips only when participantCount>1.
+
+// setupResultRouter wires GetSummary + GetResult and AutoMigrates SummaryResult
+// (setupTestDBs does not migrate it). Returns the migrated db + router.
+func setupResultRouter(t *testing.T) (*gorm.DB, *gorm.DB, *gin.Engine) {
+	t.Helper()
+	db, imDB := setupTestDBs(t)
+	if err := db.AutoMigrate(&model.SummaryResult{}); err != nil {
+		t.Fatalf("migrate SummaryResult: %v", err)
+	}
+	h := NewTaskHandler(db, imDB, "")
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(middleware.AuthMiddleware(&mockTokenResolver{}), middleware.SpaceMiddleware())
+	r.GET("/api/v1/summaries/:id", h.GetSummary)
+	r.GET("/api/v1/summaries/:id/result", h.GetResult)
+	return db, imDB, r
+}
+
+// seedResultTask creates a Completed BY_PERSON task with `nParticipants`
+// participant rows (creator1 is always the first) and a SummaryResult that
+// carries one plain citation. Returns the task ID.
+func seedResultTask(t *testing.T, db *gorm.DB, nParticipants int) int64 {
+	t.Helper()
+	task := model.SummaryTask{
+		TaskNo:      fmt.Sprintf("TST-P1A-%d", nParticipants),
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson, // every task is ModeByPerson in this DB
+		Status:      model.StatusCompleted,
+	}
+	db.Create(&task)
+	db.Create(&model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp_abc"})
+
+	uids := []string{"creator1", "participant2", "participant3"}
+	for i := 0; i < nParticipants; i++ {
+		db.Create(&model.SummaryParticipant{
+			TaskID: task.ID, UserID: uids[i], UserName: uids[i], Status: model.ParticipantCompleted,
+		})
+	}
+
+	res := model.SummaryResult{
+		TaskID:      task.ID,
+		Content:     "team/solo summary [1]",
+		Version:     1,
+		GeneratedAt: timezone.Now(),
+	}
+	res.SetCitations([]model.Citation{{Index: 1, Sender: "s", Content: "原始消息", ChannelID: "grp_abc"}})
+	db.Create(&res)
+	return task.ID
+}
+
+// citationsFromBody extracts data.result.citations from a GetSummary response.
+func summaryResultCitations(t *testing.T, w *httptest.ResponseRecorder) []json.RawMessage {
+	t.Helper()
+	var resp struct {
+		Data struct {
+			Result struct {
+				Citations []json.RawMessage `json:"citations"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal GetSummary body: %v; body=%s", err, w.Body.String())
+	}
+	return resp.Data.Result.Citations
+}
+
+// citationsFromResultBody extracts data.citations from a GetResult response.
+func getResultCitations(t *testing.T, w *httptest.ResponseRecorder) []json.RawMessage {
+	t.Helper()
+	var resp struct {
+		Data struct {
+			Citations []json.RawMessage `json:"citations"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal GetResult body: %v; body=%s", err, w.Body.String())
+	}
+	return resp.Data.Citations
+}
+
+// TestGetSummary_SinglePerson_KeepsPlainCitations: a single-person task
+// (participantCount==1) with citations must KEEP its plain citations.
+// FAIL-BEFORE: the old `if task.SummaryMode == model.ModeByPerson` branch fired
+// for this task too (every task is ModeByPerson), so citations were cleared and
+// this assertion failed. PASS-AFTER: len(participants)>1 is false -> kept.
+func TestGetSummary_SinglePerson_KeepsPlainCitations(t *testing.T) {
+	db, _, r := setupResultRouter(t)
+	taskID := seedResultTask(t, db, 1) // single participant (creator1 only)
+
+	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", taskID), "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	cits := summaryResultCitations(t, w)
+	if len(cits) == 0 {
+		t.Errorf("single-person GetSummary must KEEP plain citations for [n] sourcing; got none. body=%s", w.Body.String())
+	}
+}
+
+// TestGetSummary_MultiPerson_StripsPlainCitations: a true multi-person task
+// (participantCount>1) must STRIP plain citations (they would leak other
+// members' raw chat messages).
+func TestGetSummary_MultiPerson_StripsPlainCitations(t *testing.T) {
+	db, _, r := setupResultRouter(t)
+	taskID := seedResultTask(t, db, 2) // creator1 + participant2
+
+	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", taskID), "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	cits := summaryResultCitations(t, w)
+	if len(cits) != 0 {
+		t.Errorf("multi-person GetSummary must STRIP plain citations (privacy); got %d. body=%s", len(cits), w.Body.String())
+	}
+}
+
+// TestGetResult_SinglePerson_KeepsPlainCitations: same single-person rule for
+// GetResult, which now counts participants via loadTaskParticipantCount.
+// FAIL-BEFORE: old `task.SummaryMode == model.ModeByPerson` cleared them for the
+// single-person task too. PASS-AFTER: pc==1 -> kept.
+func TestGetResult_SinglePerson_KeepsPlainCitations(t *testing.T) {
+	db, _, r := setupResultRouter(t)
+	taskID := seedResultTask(t, db, 1)
+
+	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d/result", taskID), "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	cits := getResultCitations(t, w)
+	if len(cits) == 0 {
+		t.Errorf("single-person GetResult must KEEP plain citations for [n] sourcing; got none. body=%s", w.Body.String())
+	}
+}
+
+// TestGetResult_MultiPerson_StripsPlainCitations: multi-person GetResult strips.
+func TestGetResult_MultiPerson_StripsPlainCitations(t *testing.T) {
+	db, _, r := setupResultRouter(t)
+	taskID := seedResultTask(t, db, 2)
+
+	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d/result", taskID), "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	cits := getResultCitations(t, w)
+	if len(cits) != 0 {
+		t.Errorf("multi-person GetResult must STRIP plain citations (privacy); got %d. body=%s", len(cits), w.Body.String())
+	}
 }

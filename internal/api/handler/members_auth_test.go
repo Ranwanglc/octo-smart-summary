@@ -1881,3 +1881,98 @@ func TestGetPersonal_EmptySpaceHeader_Returns404(t *testing.T) {
 	w := doWrongSpaceRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d/personal", taskID), "participant1", "", nil)
 	assertCrossSpace404(t, w)
 }
+
+// --- P1-B: AddMembers must reject TERMINAL tasks (Failed / Cancelled) ---
+//
+// Root cause: AddMembers loaded the task (creator gate) but never checked its
+// status, so a member could be added to a Failed/Cancelled task. The new member
+// is created Pending and has NO recovery path: Accept's revive CAS is
+// WHERE status=Completed and the worker's task CAS also misses a terminal task,
+// so the member is stuck Pending forever. The status gate only blocks the two
+// TRUE terminal states (StatusFailed=4 / StatusCancelled=5); Pending /
+// WaitingConfirm / Processing / Completed are still allowed (Completed is this
+// PR's revive-recompute scenario and must NOT be blocked).
+
+// seedTaskWithStatus creates a single-creator task in the given status, used to
+// drive the AddMembers status gate. Returns the task ID.
+func seedTaskWithStatus(t *testing.T, db *gorm.DB, status int) int64 {
+	t.Helper()
+	task := model.SummaryTask{
+		TaskNo:      fmt.Sprintf("TST-P1B-%d", status),
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      status,
+	}
+	db.Create(&task)
+	db.Create(&model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp_abc"})
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "creator1", Status: model.ParticipantCompleted})
+	return task.ID
+}
+
+func TestAddMembers_TaskFailed_Rejected(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedTaskWithStatus(t, db, model.StatusFailed)
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalEditRouter(h)
+
+	body := map[string]interface{}{"user_ids": []string{"newcomer1"}}
+	w := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/members", taskID), "creator1", body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 adding to a Failed task, got %d: %s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("40005")) {
+		t.Errorf("expected code 40005 for terminal-task reject, body=%s", w.Body.String())
+	}
+	// No participant must have been inserted for the new member.
+	var cnt int64
+	db.Model(&model.SummaryParticipant{}).Where("task_id = ? AND user_id = ?", taskID, "newcomer1").Count(&cnt)
+	if cnt != 0 {
+		t.Errorf("rejected add must NOT insert a participant, got %d", cnt)
+	}
+}
+
+func TestAddMembers_TaskCancelled_Rejected(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedTaskWithStatus(t, db, model.StatusCancelled)
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalEditRouter(h)
+
+	body := map[string]interface{}{"user_ids": []string{"newcomer1"}}
+	w := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/members", taskID), "creator1", body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 adding to a Cancelled task, got %d: %s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("40005")) {
+		t.Errorf("expected code 40005 for terminal-task reject, body=%s", w.Body.String())
+	}
+	var cnt int64
+	db.Model(&model.SummaryParticipant{}).Where("task_id = ? AND user_id = ?", taskID, "newcomer1").Count(&cnt)
+	if cnt != 0 {
+		t.Errorf("rejected add must NOT insert a participant, got %d", cnt)
+	}
+}
+
+// TestAddMembers_TaskCompleted_Allowed: a Completed task must STILL accept new
+// members -- this is the PR's revive-recompute scenario; the status gate must
+// only block Failed/Cancelled, never Completed.
+func TestAddMembers_TaskCompleted_Allowed(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedMultiPersonTask(t, db) // Completed BY_PERSON, creator + 2 members
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalEditRouter(h)
+
+	body := map[string]interface{}{"user_ids": []string{"newcomer1"}}
+	w := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/members", taskID), "creator1", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 adding to a Completed task (revive-recompute), got %d: %s", w.Code, w.Body.String())
+	}
+	// The new member must have been inserted (Pending).
+	var p model.SummaryParticipant
+	if err := db.Where("task_id = ? AND user_id = ?", taskID, "newcomer1").First(&p).Error; err != nil {
+		t.Fatalf("Completed-task add must insert the new participant: %v", err)
+	}
+	if p.Status != model.ParticipantPending {
+		t.Errorf("new member must be Pending, got status=%d", p.Status)
+	}
+}
