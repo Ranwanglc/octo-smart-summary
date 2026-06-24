@@ -102,6 +102,52 @@ func (h *TaskHandler) pickDisplayResult(taskID int64) (model.SummaryResult, bool
 	return result, true
 }
 
+// callerPlainCitationsVisible decides whether the caller may see a display
+// SummaryResult's plain (non-team) citations.
+//
+// Privacy contract (yujiawei P1): plain citations embed the RAW chat messages of
+// the member who produced them, and only ever apply to BY_PERSON tasks. They may
+// only be returned to the producing member -- if the displayed result's
+// contributor user_id != caller, redact.
+//
+//   - BY_GROUP tasks (SummaryMode != ModeByPerson) have NO per-member privacy
+//     concern: their citations reference shared group chat visible to the whole
+//     group, and there are no per-person personal_result rows. Always visible.
+//   - BY_PERSON: the team SummaryResult table has NO contributor column, and
+//     plain citations are only ever written by the single-person direct path
+//     (worker/personal_processor.go: SetCitations) from exactly ONE
+//     PersonalResult; the multi-person meta path writes team_citations only and
+//     leaves plain citations empty. So the producer is precisely the
+//     PersonalResult whose citations_json equals the displayed result's. Rather
+//     than reverse-map to a producer id, we directly test ownership: the plain
+//     citations are visible only if the CALLER owns a PersonalResult for this
+//     task whose citations_json matches (the single-person edit mirror, edit.go
+//     F1, keeps them in sync even after edits). This is both the precise
+//     judgement (contributor == caller) AND fail-closed: any caller who is not
+//     the producer (e.g. a creator reading a single-confirmed scheduled round
+//     where only memberA materialized a personal_result) gets []. The normal
+//     single-person case (caller is the sole participant and producer) keeps
+//     plain citations so [n] source links still work.
+func callerPlainCitationsVisible(db *gorm.DB, task *model.SummaryTask, callerID string, result *model.SummaryResult) bool {
+	if task.SummaryMode != model.ModeByPerson {
+		return true
+	}
+	if callerID == "" {
+		return false
+	}
+	want := result.CitationsJSON
+	// An empty/[] citation set carries no raw messages -> nothing to protect.
+	if want == "" || want == "[]" {
+		return true
+	}
+	var pr model.PersonalResult
+	err := db.
+		Where("task_id = ? AND user_id = ? AND citations_json = ?", task.ID, callerID, want).
+		Limit(1).
+		First(&pr).Error
+	return err == nil
+}
+
 type apiResponse struct {
 	Code    int         `json:"code"`
 	Message string      `json:"message"`
@@ -603,14 +649,17 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 
 	var resultOut interface{}
 	if hasResult {
-		// B2 (privacy): only a TRUE multi-person BY_PERSON team summary has plain
-		// citations that contain OTHER members' raw chat messages, so those must not
-		// be shipped to any participant. A single-person task's plain citations only
-		// reference the caller's own messages -> keep them so [n] source links work.
-		// Multi-person judged by participantCount>1 (same rule as edit.go:107 etc).
-		// participants is already loaded above (task.go:579); do NOT re-query.
+		// B2 (privacy, yujiawei P1): plain citations embed the RAW chat messages of
+		// the member who PRODUCED them and may only be returned to that member. The
+		// old gate stripped only when participantCount>1, which leaked memberA's raw
+		// citations to the creator in a single-confirmed scheduled round (creator has
+		// read access via CreatorID but is NOT the producer, and len(participants)==1
+		// so the count gate stayed open). Correct judgement: redact unless the CALLER
+		// owns the producing PersonalResult (callerOwnsPlainCitations). This keeps the
+		// normal single-person case (caller is the sole producer) fully visible.
+		callerID := middleware.GetUserID(c)
 		plainCitations := latestResult.GetCitations()
-		if len(participants) > 1 {
+		if !callerPlainCitationsVisible(h.db, &task, callerID, &latestResult) {
 			plainCitations = []model.Citation{}
 		}
 		resultOut = gin.H{
@@ -777,7 +826,7 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 		return
 	}
 
-	_, authorized := h.authorizeTaskAccess(c, taskID)
+	taskPtr, authorized := h.authorizeTaskAccess(c, taskID)
 	if !authorized {
 		return
 	}
@@ -789,18 +838,18 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 		return
 	}
 
-	// B2 (privacy): only a TRUE multi-person team result leaks OTHER members' raw
-	// chat citations; a single-person task's plain citations reference only the
-	// caller's own messages -> keep them so [n] source links work. Multi-person is
-	// participantCount>1 (same rule as edit.go:107 etc). No participant list is in
-	// scope here, so query the count once via loadTaskParticipantCount.
+	// B2 (privacy, yujiawei P1): plain citations embed the RAW chat messages of
+	// the member who PRODUCED them and may only be returned to that member. The
+	// old gate stripped only when participantCount>1, which leaked memberA's raw
+	// citations to the creator in a single-confirmed scheduled round (creator has
+	// read access but is NOT the producer, and the count is 1 so the gate stayed
+	// open). Correct judgement: redact unless the CALLER owns the producing
+	// PersonalResult (callerPlainCitationsVisible) -- fail-closed for everyone
+	// else, while the normal single-person producer (and all BY_GROUP tasks) keep
+	// plain citations visible.
+	callerID := middleware.GetUserID(c)
 	plainCitations := result.GetCitations()
-	pc, err := loadTaskParticipantCount(h.db, taskID)
-	if err != nil {
-		// Conservative fail-closed (privacy over feature): on count error, strip.
-		log.Printf("[task] GetResult participant count error task=%d: %v", taskID, err)
-		plainCitations = []model.Citation{}
-	} else if pc > 1 {
+	if !callerPlainCitationsVisible(h.db, taskPtr, callerID, &result) {
 		plainCitations = []model.Citation{}
 	}
 

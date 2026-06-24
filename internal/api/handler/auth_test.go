@@ -541,8 +541,11 @@ func TestGetSummary_PermissionsSinglePersonCreator(t *testing.T) {
 func setupResultRouter(t *testing.T) (*gorm.DB, *gorm.DB, *gin.Engine) {
 	t.Helper()
 	db, imDB := setupTestDBs(t)
-	if err := db.AutoMigrate(&model.SummaryResult{}); err != nil {
-		t.Fatalf("migrate SummaryResult: %v", err)
+	// PersonalResult is needed too: the citation-privacy gate now identifies the
+	// producer of a plain-citation set by the PersonalResult that owns those exact
+	// citations (callerOwnsPlainCitations).
+	if err := db.AutoMigrate(&model.SummaryResult{}, &model.PersonalResult{}); err != nil {
+		t.Fatalf("migrate SummaryResult/PersonalResult: %v", err)
 	}
 	h := NewTaskHandler(db, imDB, "")
 	gin.SetMode(gin.TestMode)
@@ -555,7 +558,14 @@ func setupResultRouter(t *testing.T) (*gorm.DB, *gorm.DB, *gin.Engine) {
 
 // seedResultTask creates a Completed BY_PERSON task with `nParticipants`
 // participant rows (creator1 is always the first) and a SummaryResult that
-// carries one plain citation. Returns the task ID.
+// carries one plain citation. The plain citations are attributed to a PRODUCER
+// PersonalResult so the ownership-based privacy gate behaves like production:
+//   - single-person: producer == creator1 (the sole participant), so creator1
+//     keeps the citations (their own messages).
+//   - multi-person: producer is participant2 (NOT the creator). The team
+//     SummaryResult in this fixture still carries plain citations to model the
+//     leak scenario; creator1 must be redacted because they are not the producer.
+// Returns the task ID.
 func seedResultTask(t *testing.T, db *gorm.DB, nParticipants int) int64 {
 	t.Helper()
 	task := model.SummaryTask{
@@ -569,20 +579,50 @@ func seedResultTask(t *testing.T, db *gorm.DB, nParticipants int) int64 {
 	db.Create(&model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp_abc"})
 
 	uids := []string{"creator1", "participant2", "participant3"}
+	parts := make([]model.SummaryParticipant, 0, nParticipants)
 	for i := 0; i < nParticipants; i++ {
-		db.Create(&model.SummaryParticipant{
+		p := model.SummaryParticipant{
 			TaskID: task.ID, UserID: uids[i], UserName: uids[i], Status: model.ParticipantCompleted,
-		})
+		}
+		db.Create(&p)
+		parts = append(parts, p)
 	}
 
+	cits := []model.Citation{{Index: 1, Sender: "s", Content: "原始消息", ChannelID: "grp_abc"}}
 	res := model.SummaryResult{
 		TaskID:      task.ID,
 		Content:     "team/solo summary [1]",
 		Version:     1,
 		GeneratedAt: timezone.Now(),
 	}
-	res.SetCitations([]model.Citation{{Index: 1, Sender: "s", Content: "原始消息", ChannelID: "grp_abc"}})
+	res.SetCitations(cits)
 	db.Create(&res)
+
+	// Attribute the plain citations to their producer's PersonalResult. For
+	// single-person that is creator1; for multi-person we attribute them to
+	// participant2 to model a result whose plain citations belong to a non-creator
+	// member (the leak shape).
+	producer := "creator1"
+	if nParticipants > 1 {
+		producer = "participant2"
+	}
+	var producerRefID int64
+	for _, p := range parts {
+		if p.UserID == producer {
+			producerRefID = p.ID
+		}
+	}
+	now := timezone.Now()
+	pr := model.PersonalResult{
+		TaskID:           task.ID,
+		ParticipantRefID: producerRefID,
+		UserID:           producer,
+		Content:          "team/solo summary [1]",
+		SubmittedAt:      &now,
+		GeneratedAt:      &now,
+	}
+	pr.SetCitations(cits)
+	db.Create(&pr)
 	return task.ID
 }
 
@@ -682,5 +722,128 @@ func TestGetResult_MultiPerson_StripsPlainCitations(t *testing.T) {
 	cits := getResultCitations(t, w)
 	if len(cits) != 0 {
 		t.Errorf("multi-person GetResult must STRIP plain citations (privacy); got %d. body=%s", len(cits), w.Body.String())
+	}
+}
+
+// --- P1 (yujiawei): citation leak in a single-confirmed scheduled CONFIRM round ---
+//
+// Leak shape: a scheduled CONFIRM round materializes exactly ONE participant row
+// (memberA), memberA confirms, the creator does NOT. The single-person direct
+// path then writes memberA's RAW chat citations into the team SummaryResult.
+// participantCount==1, so the OLD count-based gate (len(participants)>1 /
+// loadTaskParticipantCount>1) stayed open and shipped memberA's raw messages to
+// the creator -- who has read access via CreatorID but is NOT the producer.
+//
+// seedSingleConfirmLeakTask reproduces exactly that DB shape: one participant
+// (memberA, NOT the creator) with a PersonalResult whose citations were copied
+// onto the team SummaryResult.
+func seedSingleConfirmLeakTask(t *testing.T, db *gorm.DB) int64 {
+	t.Helper()
+	task := model.SummaryTask{
+		TaskNo:      "TST-LEAK-001",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+		TriggerType: model.TriggerScheduled,
+	}
+	db.Create(&task)
+	db.Create(&model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp_abc"})
+
+	// Exactly ONE materialized participant: memberA (a non-creator member).
+	part := model.SummaryParticipant{
+		TaskID: task.ID, UserID: "memberA", UserName: "memberA", Status: model.ParticipantCompleted,
+	}
+	db.Create(&part)
+
+	cits := []model.Citation{{Index: 1, Sender: "memberA", Content: "memberA 的私密聊天", ChannelID: "grp_abc"}}
+	res := model.SummaryResult{
+		TaskID:      task.ID,
+		Content:     "scheduled round summary [1]",
+		Version:     1,
+		GeneratedAt: timezone.Now(),
+	}
+	res.SetCitations(cits) // single-person direct path copied memberA's citations here
+	db.Create(&res)
+
+	now := timezone.Now()
+	pr := model.PersonalResult{
+		TaskID:           task.ID,
+		ParticipantRefID: part.ID,
+		UserID:           "memberA",
+		Content:          "scheduled round summary [1]",
+		SubmittedAt:      &now,
+		GeneratedAt:      &now,
+	}
+	pr.SetCitations(cits)
+	db.Create(&pr)
+	return task.ID
+}
+
+// TestGetSummary_SingleConfirmLeak_CreatorRedacted is the P1 regression for
+// GetSummary. The creator (read access via CreatorID, NOT the producer) must NOT
+// see memberA's plain citations.
+// FAIL-BEFORE: the count gate (len(participants)==1) left citations intact ->
+// non-empty -> leak. PASS-AFTER: callerOwnsPlainCitations(creator1) is false
+// (creator owns no PersonalResult with these citations) -> stripped to [].
+func TestGetSummary_SingleConfirmLeak_CreatorRedacted(t *testing.T) {
+	db, _, r := setupResultRouter(t)
+	taskID := seedSingleConfirmLeakTask(t, db)
+
+	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", taskID), "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	cits := summaryResultCitations(t, w)
+	if len(cits) != 0 {
+		t.Errorf("P1 LEAK: creator must NOT see memberA's plain citations; got %d. body=%s", len(cits), w.Body.String())
+	}
+}
+
+// TestGetResult_SingleConfirmLeak_CreatorRedacted is the same P1 regression for
+// GetResult.
+func TestGetResult_SingleConfirmLeak_CreatorRedacted(t *testing.T) {
+	db, _, r := setupResultRouter(t)
+	taskID := seedSingleConfirmLeakTask(t, db)
+
+	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d/result", taskID), "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	cits := getResultCitations(t, w)
+	if len(cits) != 0 {
+		t.Errorf("P1 LEAK: creator must NOT see memberA's plain citations via GetResult; got %d. body=%s", len(cits), w.Body.String())
+	}
+}
+
+// TestGetSummary_SingleConfirmLeak_ProducerSeesOwn: the producing member
+// (memberA) IS the contributor, so they keep their own plain citations -- the
+// fix must not over-redact the legitimate owner.
+func TestGetSummary_SingleConfirmLeak_ProducerSeesOwn(t *testing.T) {
+	db, _, r := setupResultRouter(t)
+	taskID := seedSingleConfirmLeakTask(t, db)
+
+	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", taskID), "memberA")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	cits := summaryResultCitations(t, w)
+	if len(cits) == 0 {
+		t.Errorf("producer memberA must KEEP their own plain citations; got none. body=%s", w.Body.String())
+	}
+}
+
+// TestGetResult_SingleConfirmLeak_ProducerSeesOwn: same, via GetResult.
+func TestGetResult_SingleConfirmLeak_ProducerSeesOwn(t *testing.T) {
+	db, _, r := setupResultRouter(t)
+	taskID := seedSingleConfirmLeakTask(t, db)
+
+	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d/result", taskID), "memberA")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	cits := getResultCitations(t, w)
+	if len(cits) == 0 {
+		t.Errorf("producer memberA must KEEP their own plain citations via GetResult; got none. body=%s", w.Body.String())
 	}
 }

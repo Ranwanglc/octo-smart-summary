@@ -19,6 +19,21 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+// assertBizCode unmarshals the response body and asserts resp.Code, instead of
+// a brittle bytes.Contains substring match on the raw JSON (which can falsely
+// match a code appearing anywhere -- e.g. inside a message, id, or timestamp).
+// Mirrors the resp.Code style already used in auth_test.go.
+func assertBizCode(t *testing.T, w *httptest.ResponseRecorder, want int) {
+	t.Helper()
+	var resp apiResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response body: %v; body=%s", err, w.Body.String())
+	}
+	if resp.Code != want {
+		t.Errorf("expected biz code %d, got %d; body=%s", want, resp.Code, w.Body.String())
+	}
+}
+
 func setupMembersTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 
@@ -444,12 +459,7 @@ func TestPersonalEdit_NonParticipantForbidden(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Errorf("expected 404 for in-space non-participant personal-edit, got %d: %s", w.Code, w.Body.String())
 	}
-	if !bytes.Contains(w.Body.Bytes(), []byte("40008")) {
-		t.Errorf("in-space non-participant must return code 40008 (not the leaky 40003), body=%s", w.Body.String())
-	}
-	if bytes.Contains(w.Body.Bytes(), []byte("40003")) {
-		t.Errorf("in-space non-participant must NOT return the differentiated 40003 leak, body=%s", w.Body.String())
-	}
+	assertBizCode(t, w, 40008) // 40008, never the leaky differentiated 40003
 }
 
 func TestPersonalEdit_CannotEditOthers(t *testing.T) {
@@ -1628,9 +1638,7 @@ func TestPersonalEdit_WrongSpace_Returns404(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for cross-space personal-edit, got %d: %s", w.Code, w.Body.String())
 	}
-	if !bytes.Contains(w.Body.Bytes(), []byte("40008")) {
-		t.Errorf("cross-space personal-edit must return code 40008, body=%s", w.Body.String())
-	}
+	assertBizCode(t, w, 40008)
 
 	// The report must NOT have been modified.
 	var prX model.PersonalResult
@@ -1795,9 +1803,7 @@ func assertCrossSpace404(t *testing.T, w *httptest.ResponseRecorder) {
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for cross-space access, got %d: %s", w.Code, w.Body.String())
 	}
-	if !bytes.Contains(w.Body.Bytes(), []byte("40008")) {
-		t.Errorf("cross-space access must return code 40008, body=%s", w.Body.String())
-	}
+	assertBizCode(t, w, 40008)
 }
 
 // setupPersonalActionRouter wires the (task_id,user_id)-only personal endpoints
@@ -2134,9 +2140,7 @@ func TestAddMembers_TaskFailed_Rejected(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 adding to a Failed task, got %d: %s", w.Code, w.Body.String())
 	}
-	if !bytes.Contains(w.Body.Bytes(), []byte("40005")) {
-		t.Errorf("expected code 40005 for terminal-task reject, body=%s", w.Body.String())
-	}
+	assertBizCode(t, w, 40005)
 	// No participant must have been inserted for the new member.
 	var cnt int64
 	db.Model(&model.SummaryParticipant{}).Where("task_id = ? AND user_id = ?", taskID, "newcomer1").Count(&cnt)
@@ -2156,9 +2160,7 @@ func TestAddMembers_TaskCancelled_Rejected(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 adding to a Cancelled task, got %d: %s", w.Code, w.Body.String())
 	}
-	if !bytes.Contains(w.Body.Bytes(), []byte("40005")) {
-		t.Errorf("expected code 40005 for terminal-task reject, body=%s", w.Body.String())
-	}
+	assertBizCode(t, w, 40005)
 	var cnt int64
 	db.Model(&model.SummaryParticipant{}).Where("task_id = ? AND user_id = ?", taskID, "newcomer1").Count(&cnt)
 	if cnt != 0 {
@@ -2242,8 +2244,14 @@ func TestPersonalEdit_CrossSpaceNonParticipant_Returns404NotLeak(t *testing.T) {
 
 	w := doWrongSpaceRequest(r, "PUT", fmt.Sprintf("/api/v1/summaries/%d/personal-edit", taskID),
 		"stranger1", "other_space", map[string]interface{}{"content": "cross-space non-participant edit"})
-	assertCrossSpace404(t, w) // asserts 404 + body contains 40008
-	if bytes.Contains(w.Body.Bytes(), []byte("40003")) {
+	assertCrossSpace404(t, w) // asserts 404 + resp.Code == 40008
+	// 40008 (asserted above) already excludes the 40003 participant oracle; assert
+	// on the parsed code rather than a brittle substring scan of the raw body.
+	var resp apiResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response body: %v; body=%s", err, w.Body.String())
+	}
+	if resp.Code == 40003 {
 		t.Errorf("cross-space non-participant must NOT leak the 40003 participant oracle, body=%s", w.Body.String())
 	}
 }
