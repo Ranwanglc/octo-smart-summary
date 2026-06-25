@@ -86,8 +86,10 @@ type Config struct {
 	ToolCallTimeout int
 
 	// FeatureTeamSchedule gates multi-participant scheduled summaries across both the
-	// API guards and the worker scheduler. Default OFF: API keeps rejecting multi-person
-	// schedules (40015) and the worker keeps disabling multi-person schedules.
+	// API guards and the worker scheduler. Default ON: API accepts multi-person
+	// schedules and the worker runs them via the multi-person execution path. Set
+	// FEATURE_TEAM_SCHEDULE=false to restore the legacy single-person-only behavior
+	// (API rejects multi-person schedules with 40015, worker disables them).
 	FeatureTeamSchedule bool
 }
 
@@ -139,7 +141,7 @@ func Load() *Config {
 
 		ToolCallTimeout: envInt("TOOL_CALL_TIMEOUT", 30),
 
-		FeatureTeamSchedule: envBool("FEATURE_TEAM_SCHEDULE", false),
+		FeatureTeamSchedule: envBool("FEATURE_TEAM_SCHEDULE", true),
 	}
 }
 
