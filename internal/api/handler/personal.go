@@ -37,6 +37,22 @@ const acceptReviveLeaseMinutes = 20
 // The outer handler maps it to 404/40008 rather than a 500.
 var errPersonalResultGone = errors.New("personal result gone")
 
+// errDraftAlreadySubmitted is a sentinel returned from the PersonalDraft
+// transaction when the conditional UPDATE (WHERE submitted_at IS NULL) matches
+// 0 rows AND a follow-up SELECT confirms the row still exists -- i.e. a racing
+// Submit (manual or system back-fill) set submitted_at between PersonalDraft's
+// fast-path read and the UPDATE. The outer handler maps it to 409/40016
+// ("草稿已被提交"). Splitting this from errPersonalResultGone (404/40008) lets
+// the front-end disambiguate "row physically gone (Leave)" from "row exists but
+// already submitted (must reload to switch to /personal-edit)".
+//
+// 40016 was chosen because schedule.go already owns 40015 for
+// errMultiPersonNotSupported; 40016 is the next free slot in the 4001x band
+// (verified empty across internal/ at branch creation). If a future change
+// claims 40016, shift to the next free slot in the same band and update the
+// docstring + tests.
+var errDraftAlreadySubmitted = errors.New("personal draft already submitted")
+
 // PersonalHandler handles P2 by-person endpoints.
 type PersonalHandler struct {
 	db               *gorm.DB
@@ -568,6 +584,164 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 	})
 
 	ok(c, gin.H{"edited_at": now.Format(time.RFC3339)})
+}
+
+// PersonalDraft handles PUT /api/v1/summaries/:id/personal-draft
+//
+// OCT-21: a participant edits THEIR OWN personal report BEFORE submitting it,
+// without triggering team recompute. The caller can only ever touch the
+// PersonalResult keyed by (task_id, user_id=self) -- there is no way to address
+// another member's row. This handler is intentionally split from PersonalEdit
+// so the "draft" path stays free of every behaviour that belongs to the
+// post-submit edit flow:
+//
+//   - does NOT write edited_at        (draft is not a logical "edit")
+//   - does NOT revive the task        (no Completed -> Processing flip)
+//   - does NOT trigger meta_summary   (team summary unaffected by drafts)
+//   - does NOT touch task.status / worker_status / submitted_at / submit_source
+//   - does NOT open the meta lock
+//
+// State-machine: write is permitted only when worker_status == Completed AND
+// submitted_at IS NULL. submitted_at != nil short-circuits to 409/40016 so the
+// caller knows to reload and switch to /personal-edit (which DOES trigger team
+// recompute). After submit, going through this handler would silently produce
+// a team summary stale relative to the participant content.
+//
+// Reuses edit.go's content validation (non-empty, <=maxContentBytes,
+// CleanUnreferencedCitations) and personal.go's auth chain (requireTaskInSpace
+// + participant lookup + (task_id,user_id=self) PR lookup).
+func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+	taskID, valid := h.parseTaskID(c)
+	if !valid {
+		return
+	}
+
+	var req struct {
+		Content string `json:"content"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
+		return
+	}
+	if strings.TrimSpace(req.Content) == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "content cannot be empty"})
+		return
+	}
+	if len(req.Content) > maxContentBytes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "content 超过 500KB 限制"})
+		return
+	}
+
+	// P1 (cross-space isolation): identical ordering to PersonalEdit -- the task
+	// must exist AND live in the caller's space BEFORE any (task_id,user_id)
+	// participant lookup. requireTaskInSpace also fail-closes an empty
+	// X-Space-Id. Note: the router group has StrictSpaceMiddleware mounted, so
+	// for write methods (incl. PUT) a missing X-Space-Id is rejected at the
+	// middleware with 400/40001 and this handler never runs; requireTaskInSpace
+	// is the defence-in-depth.
+	if !h.requireTaskInSpace(c, taskID) {
+		return
+	}
+
+	// Caller MUST be a participant of this task. Same 40008 ("你不是该任务的参与者")
+	// as PersonalEdit / Accept so participation is not leaked across spaces.
+	var participant model.SummaryParticipant
+	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&participant).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "你不是该任务的参与者"})
+		return
+	}
+
+	// Locate the caller's OWN personal result (task_id + user_id=self). No other
+	// member's row is reachable from here.
+	var pr model.PersonalResult
+	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&pr).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "个人总结不存在"})
+		return
+	}
+
+	// State-machine: only allowed when the personal worker has finished and the
+	// row has not yet been submitted. 40005 mirrors Submit's "个人总结未完成,
+	// 无法提交" code (personal.go:382-385) so the front-end can share a single
+	// toast for the "worker not done" class.
+	if pr.WorkerStatus != model.PersonalStatusCompleted {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "个人总结未完成，无法编辑草稿"})
+		return
+	}
+	// Fast-path: already submitted. The authoritative guard is the conditional
+	// UPDATE inside the transaction; this early-out spares a write in the common
+	// case (front-end already hides the draft entry once submitted_at is set).
+	if pr.SubmittedAt != nil {
+		c.JSON(http.StatusConflict, apiResponse{Code: 40016, Message: "草稿已被提交，请刷新后改走编辑接口"})
+		return
+	}
+
+	citations := pr.GetCitations()
+	cleanedCitations := service.CleanUnreferencedCitations(req.Content, citations)
+	tmp := &model.PersonalResult{}
+	tmp.SetCitations(cleanedCitations)
+	citationsJSON := tmp.CitationsJSON
+
+	// 🔴 v2 B1: concurrency-safe draft. Mirroring Submit's Blocker-2 fix
+	// (personal.go:396-404), the conditional UPDATE adds AND submitted_at IS NULL
+	// so a racing Submit (manual or system back-fill) that sets submitted_at
+	// between the fast-path read above and this UPDATE makes us lose the race
+	// cleanly (RowsAffected=0) instead of clobbering the submitted content with
+	// the draft -- which would leave team summary forever stale (draft does not
+	// trigger meta_summary).
+	//
+	// RowsAffected == 0 has two possible causes; a single follow-up SELECT
+	// inside the same transaction disambiguates them so the HTTP layer can
+	// return distinct codes (front-end behaviours diverge: 404 = row truly gone
+	// after Leave; 409 = row exists but is now submitted, must reload + retry
+	// via /personal-edit).
+	//
+	// Wrapping in a Transaction is mildly redundant for a single UPDATE +
+	// SELECT, but kept for shape-parity with PersonalEdit and to give a future
+	// audit-log write a ready insertion point.
+	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&model.PersonalResult{}).
+			Where("id = ? AND submitted_at IS NULL", pr.ID).
+			Updates(map[string]interface{}{
+				"content":        req.Content,
+				"citations_json": citationsJSON,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			// Disambiguate (a) row physically deleted (Leave/RemoveMember) from
+			// (b) row exists but submitted_at was just written by a racing
+			// Submit. The probe is read-only and stays inside the tx.
+			var probe model.PersonalResult
+			if err := tx.Select("id", "submitted_at").
+				Where("id = ?", pr.ID).First(&probe).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errPersonalResultGone
+				}
+				return err
+			}
+			// Row still exists => guard must have caught submitted_at != NULL.
+			return errDraftAlreadySubmitted
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, errPersonalResultGone) {
+			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "个人总结不存在"})
+			return
+		}
+		if errors.Is(err, errDraftAlreadySubmitted) {
+			c.JSON(http.StatusConflict, apiResponse{Code: 40016, Message: "草稿已被提交，请刷新后改走编辑接口"})
+			return
+		}
+		log.Printf("[personal] personal-draft update error task=%d user=%s: %v", taskID, userID, err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
+		return
+	}
+
+	// Intentionally no triggerWorker(meta_summary) here -- drafts do not affect
+	// the team summary until the participant explicitly submits via /submit.
+	ok(c, gin.H{})
 }
 
 // GetMembers handles GET /api/v1/summaries/:id/members
