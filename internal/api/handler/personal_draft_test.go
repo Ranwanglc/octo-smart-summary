@@ -409,3 +409,109 @@ func TestPersonalDraft_MissingSpaceHeader_StrictMiddleware(t *testing.T) {
 	}
 	assertBizCode(t, w, 40001)
 }
+
+// T16 (OCT-31, B-FIX from GPT OCT-29): unsubmitted draft re-saved with
+// content/citations identical to what's already on disk must return 200,
+// NOT 409. Root cause: this codebase opens MySQL without `clientFoundRows=true`
+// (see internal/db/db.go:11-18), so the driver reports CHANGED rows, not
+// MATCHED rows; a no-op UPDATE returns RowsAffected=0 and the original
+// implementation misclassified that as "race lost to Submit". sqlite's UPDATE
+// reports changed rows the same way, so this test reproduces the production
+// case directly. Trigger count must stay 0 (drafts are silent).
+func TestPersonalDraft_IdempotentNoopSave_T16(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID, _ := seedDraftableTask(t, db)
+	tc := newTriggerCapture(t)
+	h := NewPersonalHandler(db, tc.url(), nil)
+	r := setupPersonalDraftRouter(h)
+
+	// First save establishes the on-disk state for member_x: content +
+	// pruned citations (only [1] survives CleanUnreferencedCitations).
+	body := map[string]interface{}{"content": "member_x DRAFT [1]"}
+	w := doJSONRequest(r, "PUT", fmt.Sprintf("/api/v1/summaries/%d/personal-draft", taskID), "member_x", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("first save expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Capture the row exactly as the handler wrote it -- the next save must
+	// produce byte-identical content + citations_json.
+	var prBefore model.PersonalResult
+	db.Where("task_id = ? AND user_id = ?", taskID, "member_x").First(&prBefore)
+
+	// Second save with the same body. UPDATE's WHERE matches (submitted_at IS
+	// NULL) but no column actually changes -> RowsAffected=0. New handler
+	// branch (c) must recognise this as a no-op and return 200 instead of
+	// 409/40016.
+	w2 := doJSONRequest(r, "PUT", fmt.Sprintf("/api/v1/summaries/%d/personal-draft", taskID), "member_x", body)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("idempotent re-save expected 200, got %d: %s", w2.Code, w2.Body.String())
+	}
+
+	// Row must be unchanged byte-for-byte (no-op write).
+	var prAfter model.PersonalResult
+	db.Where("task_id = ? AND user_id = ?", taskID, "member_x").First(&prAfter)
+	if prAfter.Content != prBefore.Content || prAfter.CitationsJSON != prBefore.CitationsJSON {
+		t.Errorf("no-op save must not mutate row: before=(%q,%q) after=(%q,%q)",
+			prBefore.Content, prBefore.CitationsJSON, prAfter.Content, prAfter.CitationsJSON)
+	}
+	if prAfter.SubmittedAt != nil {
+		t.Errorf("no-op save must NOT set submitted_at, got %v", prAfter.SubmittedAt)
+	}
+	if prAfter.EditedAt != nil {
+		t.Errorf("no-op save must NOT set edited_at, got %v", prAfter.EditedAt)
+	}
+	// Drafts are silent across both saves.
+	if tc.waitFor("meta_summary", taskID) {
+		t.Errorf("idempotent save path must not trigger meta_summary")
+	}
+}
+
+// T17 (OCT-31, B-FIX partial-divergence guard): unsubmitted draft re-saved
+// with content that differs by even one byte (citations may be incidentally
+// re-pruned) must take the normal RowsAffected=1 path and return 200, never
+// landing in the probe branch. This protects T16's no-op detection from
+// over-triggering on real edits.
+func TestPersonalDraft_DivergentContentNormalPath_T17(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID, _ := seedDraftableTask(t, db)
+	tc := newTriggerCapture(t)
+	h := NewPersonalHandler(db, tc.url(), nil)
+	r := setupPersonalDraftRouter(h)
+
+	// First save: drop citation [2].
+	first := map[string]interface{}{"content": "member_x DRAFT [1]"}
+	w := doJSONRequest(r, "PUT", fmt.Sprintf("/api/v1/summaries/%d/personal-draft", taskID), "member_x", first)
+	if w.Code != http.StatusOK {
+		t.Fatalf("first save expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var pr1 model.PersonalResult
+	db.Where("task_id = ? AND user_id = ?", taskID, "member_x").First(&pr1)
+
+	// Second save: same citation set (only [1] is referenced, so
+	// citations_json will match pr1 after cleanup) but content differs by one
+	// word. RowsAffected must be 1; the probe branch must not run.
+	second := map[string]interface{}{"content": "member_x DRAFT v2 [1]"}
+	w2 := doJSONRequest(r, "PUT", fmt.Sprintf("/api/v1/summaries/%d/personal-draft", taskID), "member_x", second)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("divergent re-save expected 200, got %d: %s", w2.Code, w2.Body.String())
+	}
+	var pr2 model.PersonalResult
+	db.Where("task_id = ? AND user_id = ?", taskID, "member_x").First(&pr2)
+	if pr2.Content != "member_x DRAFT v2 [1]" {
+		t.Errorf("divergent save must persist new content, got %q", pr2.Content)
+	}
+	// citations_json should be unchanged from pr1 (same surviving set) -- this
+	// is the partial-divergence case (content differs, citations same) called
+	// out in OCT-31's T17 spec.
+	if pr2.CitationsJSON != pr1.CitationsJSON {
+		t.Errorf("citations_json should be stable across same-citation edit: before=%q after=%q",
+			pr1.CitationsJSON, pr2.CitationsJSON)
+	}
+	if pr2.SubmittedAt != nil || pr2.EditedAt != nil {
+		t.Errorf("draft path must not write submitted_at/edited_at, got submitted=%v edited=%v",
+			pr2.SubmittedAt, pr2.EditedAt)
+	}
+	if tc.waitFor("meta_summary", taskID) {
+		t.Errorf("draft path must not trigger meta_summary")
+	}
+}
