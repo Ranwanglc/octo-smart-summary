@@ -599,3 +599,80 @@ func TestPersonalDraft_FastPath_TaskStatusFlipped_ByPublish_40016_T25b(t *testin
 		t.Errorf("gate-in-tx 40016 must not trigger meta_summary")
 	}
 }
+
+// T26 — In-tx lockTask miss when task is soft-deleted mid-tx (OCT-63 P2).
+// requireTaskInSpace passes on the outer read, then the same tx's Before-query
+// callback soft-deletes summary_task before the FOR UPDATE SELECT runs. With
+// the compound WHERE `id = ? AND space_id = ? AND deleted_at IS NULL`, the
+// lockTask read returns ErrRecordNotFound → errTaskGone → 40008/404 "任务不存在"
+// (aligned with requireTaskInSpace miss). Under the pre-fix lockTask (SELECT by
+// primary key only) this same fixture would lock the soft-deleted row and let
+// the UPDATE land, returning 200. Reverse evidence is delivered by temporarily
+// restoring the old lockTask read: this test then FAILs (see PR body).
+//
+// Injection rides the SAME `Before("gorm:query")` seam as T25 (skip
+// requireTaskInSpace, fire on the 2nd summary_task query = lockTask), so the
+// sqlite `:memory:` caveats around FOR UPDATE / sibling sessions apply
+// unchanged — this test verifies the DECISION LAYER (compound-WHERE + miss
+// mapping), not wall-clock lock ordering.
+func TestPersonalDraft_InTxLockTask_TaskSoftDeleted_40008_T26(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID, xPRID := seedDraftableTask(t, db)
+
+	tc := newTriggerCapture(t)
+	h := NewPersonalHandler(db, tc.url(), nil)
+	r := setupPersonalDraftRouter(h)
+
+	cbName := "test:oct63_intx_locktask_soft_delete"
+	summaryTaskQueries := 0
+	fired := false
+	err := db.Callback().Query().Before("gorm:query").Register(cbName, func(tx *gorm.DB) {
+		if tx.Statement == nil || tx.Statement.Table != "summary_task" {
+			return
+		}
+		summaryTaskQueries++
+		// Skip outer requireTaskInSpace (call #1). Fire on the in-tx lockTask
+		// SELECT (call #2) before it runs, so its compound WHERE sees the row
+		// as soft-deleted.
+		if summaryTaskQueries < 2 || fired {
+			return
+		}
+		fired = true
+		now := timezone.Now()
+		if err := tx.Session(&gorm.Session{NewDB: true}).Exec(
+			"UPDATE summary_task SET deleted_at = ? WHERE id = ?",
+			now, taskID).Error; err != nil {
+			t.Errorf("soft-delete injector failed: %v", err)
+			return
+		}
+	})
+	if err != nil {
+		t.Fatalf("registering soft-delete callback: %v", err)
+	}
+	defer func() {
+		_ = db.Callback().Query().Remove(cbName)
+	}()
+
+	body := map[string]interface{}{"content": "draft racing soft-delete [1]"}
+	w := doJSONRequest(r, "PUT",
+		fmt.Sprintf("/api/v1/summaries/%d/personal-draft", taskID),
+		"member_x", body)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 from in-tx lockTask miss (soft-deleted), got %d: %s", w.Code, w.Body.String())
+	}
+	assertBizCode(t, w, 40008)
+	if !fired {
+		t.Errorf("soft-delete injector never fired -- lockTask SELECT branch was not exercised")
+	}
+
+	// Draft content MUST NOT have landed: gate-in-tx rolled back on errTaskGone
+	// BEFORE the UPDATE.
+	var prX model.PersonalResult
+	db.Where("id = ?", xPRID).First(&prX)
+	if prX.Content != "member_x original [1][2]" {
+		t.Errorf("errTaskGone must NOT persist draft content, got %q", prX.Content)
+	}
+	if tc.waitFor("meta_summary", taskID) {
+		t.Errorf("errTaskGone must not trigger meta_summary")
+	}
+}

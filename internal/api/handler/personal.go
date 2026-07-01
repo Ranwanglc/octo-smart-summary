@@ -53,6 +53,9 @@ var errPersonalResultGone = errors.New("personal result gone")
 // docstring + tests.
 var errDraftAlreadySubmitted = errors.New("personal draft already submitted")
 
+// 该 miss 与 requireTaskInSpace 同码映射（40008/404）。
+var errTaskGone = errors.New("summary task gone")
+
 // errDraftPublished is a sentinel returned from the PersonalDraft transaction
 // when the gate-in-tx SELECT confirms `summary_result` already exists AND
 // `task.status == Completed` -- i.e. the team summary has been published
@@ -710,6 +713,8 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 	if !taskOK {
 		return
 	}
+	// 与 requireTaskInSpace 使用同一权威 space 上下文，供 gate-in-tx 复合 WHERE 复用。
+	spaceID := middleware.GetSpaceID(c)
 	// BY_PERSON gate: PersonalDraft is only meaningful for BY_PERSON tasks.
 	// The worker pickup (personal_processor.go) does not filter by summary_mode
 	// and would happily materialise a PersonalResult on any mode; if the upstream
@@ -876,8 +881,14 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 		// same-tx GORM callback that seeds summary_result + flips task.status
 		// between fast-path and gate-in-tx.
 		var lockTask model.SummaryTask
+		// 与 requireTaskInSpace 保持同一 task 存活判定，避免 tx 前并发软删仍锁到已删除行。
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Select("id", "status").First(&lockTask, taskID).Error; err != nil {
+			Select("id", "status").
+			Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).
+			First(&lockTask).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errTaskGone
+			}
 			return err
 		}
 
@@ -965,6 +976,10 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 		}
 		return nil
 	}); err != nil {
+		if errors.Is(err, errTaskGone) {
+			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+			return
+		}
 		if errors.Is(err, errPersonalResultGone) {
 			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "个人总结不存在"})
 			return
