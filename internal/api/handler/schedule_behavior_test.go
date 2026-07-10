@@ -1296,3 +1296,99 @@ func TestUpdateSchedule_ManualToScheduled_BackfillsTaskParticipants(t *testing.T
 		t.Errorf("manual->confirm conversion must reset everyone to unconfirmed, got %+v", cfg.Participants)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// OCT-128: GET list/detail must expose creator_id so the frontend can UX-gate
+// edit affordances by owner. UpdateSchedule keeps its 403 hard gate; this is
+// display-only透出，无 schema 变更。
+// ---------------------------------------------------------------------------
+
+// newScheduleGetTestRouter mounts only the two GET endpoints under test so the
+// assertions stay focused on response shape (no CreateSchedule detours).
+func newScheduleGetTestRouter(db *gorm.DB) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(middleware.AuthMiddleware(&mockTokenResolver{}), middleware.SpaceMiddleware())
+	sh := NewScheduleHandler(db)
+	r.GET("/api/v1/summary-schedules", sh.ListSchedules)
+	r.GET("/api/v1/summary-schedules/:id", sh.GetSchedule)
+	return r
+}
+
+func TestListSchedules_ResponseIncludesCreatorID(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleGetTestRouter(db)
+
+	// Direct model insert keeps the test focused on the read path.
+	sched := model.SummarySchedule{
+		SpaceID: "s1", CreatorID: "creator-u1", Title: "T",
+		SummaryMode: model.ModeByPerson, TimeRangeType: 2,
+		IntervalDays: 1, RunTime: "09:00", IsActive: 1,
+	}
+	if err := db.Create(&sched).Error; err != nil {
+		t.Fatalf("seed schedule: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/summary-schedules", nil)
+	req.Header.Set("Token", "any-viewer")
+	req.Header.Set("X-Space-Id", "s1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET list want 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Data []map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, w.Body.String())
+	}
+	if len(resp.Data) != 1 {
+		t.Fatalf("want 1 item, got %d: %s", len(resp.Data), w.Body.String())
+	}
+	got, ok := resp.Data[0]["creator_id"]
+	if !ok {
+		t.Fatalf("list item missing creator_id key: %s", w.Body.String())
+	}
+	if got != "creator-u1" {
+		t.Fatalf("list creator_id = %v, want creator-u1", got)
+	}
+}
+
+func TestGetSchedule_ResponseIncludesCreatorID(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleGetTestRouter(db)
+
+	sched := model.SummarySchedule{
+		SpaceID: "s1", CreatorID: "creator-u1", Title: "T",
+		SummaryMode: model.ModeByPerson, TimeRangeType: 2,
+		IntervalDays: 1, RunTime: "09:00", IsActive: 1,
+	}
+	if err := db.Create(&sched).Error; err != nil {
+		t.Fatalf("seed schedule: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/summary-schedules/"+sid(sched.ID), nil)
+	req.Header.Set("Token", "any-viewer")
+	req.Header.Set("X-Space-Id", "s1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET detail want 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Data map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, w.Body.String())
+	}
+	got, ok := resp.Data["creator_id"]
+	if !ok {
+		t.Fatalf("detail missing creator_id key: %s", w.Body.String())
+	}
+	if got != "creator-u1" {
+		t.Fatalf("detail creator_id = %v, want creator-u1", got)
+	}
+}

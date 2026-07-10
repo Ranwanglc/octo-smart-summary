@@ -805,6 +805,7 @@ func (h *ScheduleHandler) ListSchedules(c *gin.Context) {
 		item := gin.H{
 			"schedule_id":        s.ID,
 			"title":              s.Title,
+			"creator_id":         s.CreatorID, // 前端按 creator 做 UX 权限判定；写操作 403 由 UpdateSchedule 兜底
 			"summary_mode":       s.SummaryMode,
 			"cron_expr":          s.CronExpr,
 			"interval_days":      s.IntervalDays,
@@ -857,6 +858,7 @@ func (h *ScheduleHandler) GetSchedule(c *gin.Context) {
 	item := gin.H{
 		"schedule_id":        sched.ID,
 		"title":              sched.Title,
+		"creator_id":         sched.CreatorID, // 前端按 creator 做 UX 权限判定；写操作 403 由 UpdateSchedule 兜底
 		"summary_mode":       sched.SummaryMode,
 		"cron_expr":          sched.CronExpr,
 		"interval_days":      sched.IntervalDays,
